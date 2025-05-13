@@ -1,8 +1,8 @@
-import traceback
-import os
-
 import argparse
 import asyncio
+import os
+import traceback
+
 import fastapi
 import uvicorn
 
@@ -12,6 +12,7 @@ TIMEOUT_KEEP_ALIVE = 5  # in seconds
 
 app = fastapi.FastAPI()
 engine = None
+
 
 @app.post("/generate")
 async def generate(req: fastapi.Request) -> fastapi.Response:
@@ -24,18 +25,18 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
     """
     req_dict = await req.json()
     raw_request = swiftllm.RawRequest(
-        prompt = req_dict["prompt"],
-        output_len = req_dict["output_len"]
+        prompt=req_dict["prompt"], output_len=req_dict["output_len"]
     )
 
     if req_dict.get("stream", False):
         generator = engine.add_request_and_stream(raw_request)
+
         async def wrapper():
             async for step_output in generator:
                 yield f"{step_output.token_id}\n"
+
         return fastapi.responses.StreamingResponse(
-            wrapper(),
-            media_type="text/plain"
+            wrapper(), media_type="text/plain"
         )
     else:
         # TODO Abort the request when the client disconnects
@@ -43,6 +44,7 @@ async def generate(req: fastapi.Request) -> fastapi.Response:
         return fastapi.responses.JSONResponse(
             content={"output_token_ids": output_token_ids}
         )
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -62,7 +64,7 @@ if __name__ == "__main__":
         host=host,
         port=port,
         log_level="info",
-        timeout_keep_alive=TIMEOUT_KEEP_ALIVE
+        timeout_keep_alive=TIMEOUT_KEEP_ALIVE,
     )
     uvicorn_server = uvicorn.Server(uvicorn_config)
 
@@ -74,9 +76,11 @@ if __name__ == "__main__":
 
         try:
             await engine_task
-        except:  # pylint: disable=broad-except
+        except Exception:  # pylint: disable=broad-except
             traceback.print_exc()
             uvicorn_task.cancel()
-            os._exit(1) # Kill myself, or it will print tons of errors. Don't know why.
-    
+            os._exit(
+                1
+            )  # Kill myself, or it will print tons of errors. Don't know why.
+
     asyncio.run(main_coroutine())

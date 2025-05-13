@@ -1,11 +1,18 @@
-import asyncio
 import argparse
+import asyncio
 import time
+
 from transformers import AutoTokenizer
 
 import swiftllm
 
-async def send_request_and_wait_streaming_mode(engine: swiftllm.Engine, tokenizer: AutoTokenizer, prompt: str, output_len: int):
+
+async def send_request_and_wait_streaming_mode(
+    engine: swiftllm.Engine,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    output_len: int,
+):
     raw_request = swiftllm.RawRequest(prompt, output_len)
     output_token_ids = []
     token_latencies = []
@@ -19,14 +26,23 @@ async def send_request_and_wait_streaming_mode(engine: swiftllm.Engine, tokenize
     print("---------------------------------")
     print(f"Prompt: {prompt}")
     print(f"Output: {tokenizer.decode(output_token_ids)}")
-    print(f"Token latencies (ms): {[round(t*1000, 1) for t in token_latencies]}")
+    print(
+        f"Token latencies (ms): {[round(t*1000, 1) for t in token_latencies]}"
+    )
 
-async def send_request_and_wait_non_streaming_mode(engine: swiftllm.Engine, tokenizer: AutoTokenizer, prompt: str, output_len: int):
+
+async def send_request_and_wait_non_streaming_mode(
+    engine: swiftllm.Engine,
+    tokenizer: AutoTokenizer,
+    prompt: str,
+    output_len: int,
+):
     raw_request = swiftllm.RawRequest(prompt, output_len)
     (_, output_token_ids) = await engine.add_request_and_wait(raw_request)
     print("---------------------------------")
     print(f"Prompt: {prompt}")
     print(f"Output: {tokenizer.decode(output_token_ids)}")
+
 
 async def main():
     parser = argparse.ArgumentParser()
@@ -37,29 +53,25 @@ async def main():
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        required=True
+        required=True,
     )
     parser.add_argument(
-        "--streaming",
-        help="Use streaming mode",
-        action="store_true"
+        "--streaming", help="Use streaming mode", action="store_true"
     )
     args = parser.parse_args()
     model_path = args.model_path
     is_streaming_mode = args.streaming
 
     engine_config = swiftllm.EngineConfig(
-        model_path = model_path,
-        use_dummy = False,
-        
-        block_size = 16,
-        gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 1024,
-        max_seqs_in_block_table = 128,
-        max_blocks_per_seq = 3072,
-
-        max_batch_size = 4,
-        max_tokens_in_batch = 1024
+        model_path=model_path,
+        use_dummy=False,
+        block_size=16,
+        gpu_mem_utilization=0.99,
+        num_cpu_blocks=1024,
+        max_seqs_in_block_table=128,
+        max_blocks_per_seq=3072,
+        max_batch_size=4,
+        max_tokens_in_batch=1024,
     )
 
     prompt_and_output_lens = [
@@ -78,12 +90,21 @@ async def main():
     tasks = []
     for prompt, output_len in prompt_and_output_lens:
         if is_streaming_mode:
-            task = asyncio.create_task(send_request_and_wait_streaming_mode(engine, tokenizer, prompt, output_len))
+            task = asyncio.create_task(
+                send_request_and_wait_streaming_mode(
+                    engine, tokenizer, prompt, output_len
+                )
+            )
         else:
-            task = asyncio.create_task(send_request_and_wait_non_streaming_mode(engine, tokenizer, prompt, output_len))
+            task = asyncio.create_task(
+                send_request_and_wait_non_streaming_mode(
+                    engine, tokenizer, prompt, output_len
+                )
+            )
         tasks.append(task)
         await asyncio.sleep(0.1)
     await asyncio.gather(*tasks)
+
 
 if __name__ == "__main__":
     asyncio.run(main())

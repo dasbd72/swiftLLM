@@ -1,19 +1,20 @@
 import itertools
 import math
 
+import swiftllm_c
 import torch
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.weight import load_weights
-from swiftllm.worker.block_manager import BlockManager
 from swiftllm.utils import GB
-import swiftllm_c
+from swiftllm.worker.block_manager import BlockManager
+from swiftllm.worker.weight import load_weights
 
+from .infer_state import LlamaInferState
+from .layers.post_layer import LlamaPostLayer
 from .layers.pre_layer import LlamaPreLayer
 from .layers.transformer_layer import LlamaTransformerLayer
-from .layers.post_layer import LlamaPostLayer
-from .infer_state import LlamaInferState
+
 
 class LlamaModel:
     """
@@ -30,17 +31,16 @@ class LlamaModel:
     """
 
     @torch.inference_mode()
-    def __init__(
-        self,
-        engine_config: EngineConfig
-    ):
+    def __init__(self, engine_config: EngineConfig):
         """
         Initialize the LlamaModel.
         """
         self.engine_config = engine_config
 
         # Load model config
-        self.model_config = LlamaModelConfig.load_from_model_path(engine_config.model_path)
+        self.model_config = LlamaModelConfig.load_from_model_path(
+            engine_config.model_path
+        )
 
         # Weight and RoPE cache
         self.weight = None
@@ -58,7 +58,7 @@ class LlamaModel:
 
         # Block manager
         self.cpu_block_manager = self.gpu_block_manager = None
-        
+
     @torch.inference_mode()
     def load_weights(self):
         """
@@ -69,7 +69,7 @@ class LlamaModel:
             self.model_config,
             torch.float16,
             self.engine_config.model_path,
-            self.engine_config.use_dummy
+            self.engine_config.use_dummy,
         )
 
         # Initialize rotary embeddings
@@ -84,7 +84,7 @@ class LlamaModel:
                 self.engine_config,
                 self.weight.layers[layer_id],
                 decoding_piggyback_stream,
-                layer_id
+                layer_id,
             )
             for layer_id in range(self.model_config.num_layers)
         ]
@@ -107,12 +107,11 @@ class LlamaModel:
         batch_size = self.engine_config.max_batch_size
         input_lens = [num_tokens // batch_size] * batch_size
         input_lens[-1] += num_tokens % batch_size
-        input_ids = [
-            [0 for _ in range(input_len)]
-            for input_len in input_lens
-        ]
+        input_ids = [[0 for _ in range(input_len)] for input_len in input_lens]
         seq_ids = list(range(batch_size))
-        self.k_cache = self.v_cache = None # pylint: disable=attribute-defined-outside-init
+        self.k_cache = self.v_cache = (
+            None  # pylint: disable=attribute-defined-outside-init
+        )
         _ = self.forward(input_ids, seq_ids, [], ignore_kvcache=True)
         torch.cuda.synchronize()
 
@@ -120,16 +119,24 @@ class LlamaModel:
         # total_memory = torch.cuda.get_device_properties(0).total_memory
         free_memory, total_memory = torch.cuda.mem_get_info()
         peak_memory = total_memory - free_memory
-        useable_memory = total_memory*self.engine_config.gpu_mem_utilization
-        print(f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB")
+        useable_memory = total_memory * self.engine_config.gpu_mem_utilization
+        print(
+            f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB"
+        )
         if useable_memory < peak_memory:
-            raise RuntimeError(f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})")
-        block_size_bytes = self.engine_config.block_size * self.model_config.get_kvslot_size()
-        num_gpu_blocks = math.floor((useable_memory - peak_memory) / block_size_bytes)
+            raise RuntimeError(
+                f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})"
+            )
+        block_size_bytes = (
+            self.engine_config.block_size * self.model_config.get_kvslot_size()
+        )
+        num_gpu_blocks = math.floor(
+            (useable_memory - peak_memory) / block_size_bytes
+        )
 
         torch.cuda.empty_cache()
         return num_gpu_blocks
-    
+
     @torch.inference_mode()
     def init_kvcache_and_swap(self, num_blocks: int):
         self.num_blocks = num_blocks
@@ -140,12 +147,16 @@ class LlamaModel:
             self.model_config.num_layers,
             self.model_config.num_kv_heads,
             self.engine_config.block_size,
-            self.model_config.head_dim
+            self.model_config.head_dim,
         )
         # Here we use torch.zeros instead of torch.empty, since that torch.empty
         # has the possibility to contain NaNs, which will cause the model to output NaNs.
-        self.k_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
-        self.v_cache = torch.zeros(kvcache_shape, dtype=torch.float16, device="cuda")
+        self.k_cache = torch.zeros(
+            kvcache_shape, dtype=torch.float16, device="cuda"
+        )
+        self.v_cache = torch.zeros(
+            kvcache_shape, dtype=torch.float16, device="cuda"
+        )
 
         # Initialize KV swap space
         kvswap_shape = (
@@ -153,10 +164,14 @@ class LlamaModel:
             self.model_config.num_layers,
             self.model_config.num_kv_heads,
             self.engine_config.block_size,
-            self.model_config.head_dim
+            self.model_config.head_dim,
         )
-        self.k_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
-        self.v_swap = torch.zeros(kvswap_shape, dtype=torch.float16, device="cpu")
+        self.k_swap = torch.zeros(
+            kvswap_shape, dtype=torch.float16, device="cpu"
+        )
+        self.v_swap = torch.zeros(
+            kvswap_shape, dtype=torch.float16, device="cpu"
+        )
 
         # Initialize block manager
         self.gpu_block_manager = BlockManager(
@@ -164,14 +179,14 @@ class LlamaModel:
             self.num_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
-            self.engine_config.block_size
+            self.engine_config.block_size,
         )
         self.cpu_block_manager = BlockManager(
             "CPU",
             self.engine_config.num_cpu_blocks,
             self.engine_config.max_seqs_in_block_table,
             self.engine_config.max_blocks_per_seq,
-            self.engine_config.block_size
+            self.engine_config.block_size,
         )
 
     def _init_to_get_rotary(self):
@@ -180,8 +195,23 @@ class LlamaModel:
         max_position_embeddings = self.model_config.max_position_embeddings
         max_seq_len = max_position_embeddings * rope_scaling_factor
 
-        inv_freq = 1.0 / (base ** (torch.arange(0, self.model_config.head_dim, 2, device="cuda", dtype=torch.float32) / self.model_config.head_dim))
-        t = torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32) / rope_scaling_factor
+        inv_freq = 1.0 / (
+            base
+            ** (
+                torch.arange(
+                    0,
+                    self.model_config.head_dim,
+                    2,
+                    device="cuda",
+                    dtype=torch.float32,
+                )
+                / self.model_config.head_dim
+            )
+        )
+        t = (
+            torch.arange(max_seq_len + 128, device="cuda", dtype=torch.float32)
+            / rope_scaling_factor
+        )
         freqs = torch.outer(t, inv_freq)
 
         self._cos_cached = torch.cos(freqs).to(torch.float16)
@@ -190,7 +220,7 @@ class LlamaModel:
     @torch.inference_mode()
     def _forward(
         self,
-        input_ids: torch.Tensor,    # [total_token_num]
+        input_ids: torch.Tensor,  # [total_token_num]
         infer_state: LlamaInferState,
     ) -> torch.Tensor:
         """
@@ -204,20 +234,24 @@ class LlamaModel:
                 residual_buf,
                 self.k_cache,
                 self.v_cache,
-                self.gpu_block_manager.block_table if not infer_state.ignore_kvcache else None,
+                (
+                    self.gpu_block_manager.block_table
+                    if not infer_state.ignore_kvcache
+                    else None
+                ),
                 infer_state,
             )
         input_embds += residual_buf
         output_tokens = self.post_layer.forward(input_embds, infer_state)
         return output_tokens
-    
+
     @torch.inference_mode()
     def forward(
         self,
-        input_ids_list: list[list[int]], # [batch_size, *]
-        seq_ids_list: list[int],     # [batch_size]
-        decoding_seq_lens_list: list[int], # [num_decoding_seqs]
-        ignore_kvcache: bool = False,   # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        input_ids_list: list[list[int]],  # [batch_size, *]
+        seq_ids_list: list[int],  # [batch_size]
+        decoding_seq_lens_list: list[int],  # [num_decoding_seqs]
+        ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
     ) -> list[int]:
         """
         Run a forward pass of the LlamaModel.
@@ -230,39 +264,62 @@ class LlamaModel:
 
         num_prefill_seqs = len(input_ids_list) - len(decoding_seq_lens_list)
         flattened_input_ids = list(itertools.chain(*input_ids_list))
-        seq_lengths_list = [len(seq) for seq in input_ids_list[:num_prefill_seqs]] + decoding_seq_lens_list
+        seq_lengths_list = [
+            len(seq) for seq in input_ids_list[:num_prefill_seqs]
+        ] + decoding_seq_lens_list
 
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        seq_lengths = torch.tensor(seq_lengths_list, dtype=torch.int32, device="cuda")
+        seq_lengths = torch.tensor(
+            seq_lengths_list, dtype=torch.int32, device="cuda"
+        )
 
         batch_size = len(input_ids_list)
         num_tokens = len(flattened_input_ids)
 
         prefill_seq_lens_list = seq_lengths_list[:num_prefill_seqs]
-        prefill_seq_lens = torch.tensor(prefill_seq_lens_list, dtype=torch.int32, device="cuda")
-        prefill_start_locs = torch.cumsum(prefill_seq_lens, dim=0, dtype=torch.int32) - prefill_seq_lens
-        max_prefill_len = max(prefill_seq_lens_list) if prefill_seq_lens_list else 0
+        prefill_seq_lens = torch.tensor(
+            prefill_seq_lens_list, dtype=torch.int32, device="cuda"
+        )
+        prefill_start_locs = (
+            torch.cumsum(prefill_seq_lens, dim=0, dtype=torch.int32)
+            - prefill_seq_lens
+        )
+        max_prefill_len = (
+            max(prefill_seq_lens_list) if prefill_seq_lens_list else 0
+        )
 
-        decoding_seq_lens = torch.tensor(decoding_seq_lens_list, dtype=torch.int32, device="cuda")
-        max_decoding_len = max(decoding_seq_lens_list) if decoding_seq_lens_list else 0
+        decoding_seq_lens = torch.tensor(
+            decoding_seq_lens_list, dtype=torch.int32, device="cuda"
+        )
+        max_decoding_len = (
+            max(decoding_seq_lens_list) if decoding_seq_lens_list else 0
+        )
 
-        position_indices = torch.cat((
-            torch.concat([
-                torch.arange(
-                    0,
-                    prefill_seq_len,
-                    device="cuda",
-                    dtype=torch.int32
-                )
-                for prefill_seq_len in prefill_seq_lens_list
-            ]) if prefill_seq_lens_list else torch.empty(0, device="cuda", dtype=torch.int32),
-            decoding_seq_lens - 1
-        ), dim=0)
+        position_indices = torch.cat(
+            (
+                (
+                    torch.concat(
+                        [
+                            torch.arange(
+                                0,
+                                prefill_seq_len,
+                                device="cuda",
+                                dtype=torch.int32,
+                            )
+                            for prefill_seq_len in prefill_seq_lens_list
+                        ]
+                    )
+                    if prefill_seq_lens_list
+                    else torch.empty(0, device="cuda", dtype=torch.int32)
+                ),
+                decoding_seq_lens - 1,
+            ),
+            dim=0,
+        )
 
         if not ignore_kvcache:
             self.gpu_block_manager.allocate_blocks_for_seqs(
-                seq_ids,
-                seq_lengths
+                seq_ids, seq_lengths
             )
 
         # Select the seq_block_size
@@ -282,80 +339,88 @@ class LlamaModel:
 
         seq_block_size = 2048
         decoding_seq_lens_sum = sum(decoding_seq_lens_list)
-        while self.model_config.num_kv_heads*(decoding_seq_lens_sum/seq_block_size) < 1024 and seq_block_size//2 >= 64 and \
-            max_decoding_len / (seq_block_size//2) <= 128:
+        while (
+            self.model_config.num_kv_heads
+            * (decoding_seq_lens_sum / seq_block_size)
+            < 1024
+            and seq_block_size // 2 >= 64
+            and max_decoding_len / (seq_block_size // 2) <= 128
+        ):
             seq_block_size //= 2
 
         infer_state = LlamaInferState(
-            batch_size = batch_size,
-            num_tokens = num_tokens,
-
-            seq_ids = seq_ids,
-            softmax_scale = self.model_config.head_dim ** -0.5,
-
-            num_prefill_seqs = num_prefill_seqs,
-            num_prefill_tokens = num_tokens - (batch_size - num_prefill_seqs),
-            prefill_seq_start_locs = prefill_start_locs,
-            prefill_seq_start_locs_with_end = torch.cat([
-                prefill_start_locs,
-                torch.tensor([num_tokens], dtype=torch.int32, device="cuda")
-            ]),
-            prefill_seq_lens = prefill_seq_lens,
-            max_prefill_len = max_prefill_len,
-
-            num_decoding_seqs = batch_size - num_prefill_seqs,
-            decoding_seq_lens = decoding_seq_lens,
-            max_decoding_len = max_decoding_len,
-
-            seq_block_size = seq_block_size,
-            num_seq_blocks = (max_decoding_len + seq_block_size-1) // seq_block_size,
-
-            position_cos = self._cos_cached[position_indices],
-            position_sin = self._sin_cached[position_indices],
-
-            ignore_kvcache = ignore_kvcache
+            batch_size=batch_size,
+            num_tokens=num_tokens,
+            seq_ids=seq_ids,
+            softmax_scale=self.model_config.head_dim**-0.5,
+            num_prefill_seqs=num_prefill_seqs,
+            num_prefill_tokens=num_tokens - (batch_size - num_prefill_seqs),
+            prefill_seq_start_locs=prefill_start_locs,
+            prefill_seq_start_locs_with_end=torch.cat(
+                [
+                    prefill_start_locs,
+                    torch.tensor(
+                        [num_tokens], dtype=torch.int32, device="cuda"
+                    ),
+                ]
+            ),
+            prefill_seq_lens=prefill_seq_lens,
+            max_prefill_len=max_prefill_len,
+            num_decoding_seqs=batch_size - num_prefill_seqs,
+            decoding_seq_lens=decoding_seq_lens,
+            max_decoding_len=max_decoding_len,
+            seq_block_size=seq_block_size,
+            num_seq_blocks=(max_decoding_len + seq_block_size - 1)
+            // seq_block_size,
+            position_cos=self._cos_cached[position_indices],
+            position_sin=self._sin_cached[position_indices],
+            ignore_kvcache=ignore_kvcache,
         )
 
         return self._forward(
-            torch.tensor(flattened_input_ids, dtype=torch.int32, device="cuda"),
-            infer_state
+            torch.tensor(
+                flattened_input_ids, dtype=torch.int32, device="cuda"
+            ),
+            infer_state,
         ).tolist()
 
-    def _swap(
-        self,
-        seq_ids_list: list[int],
-        is_swap_in: bool
-    ):
-        src_block_manager = self.cpu_block_manager if is_swap_in else self.gpu_block_manager
-        dst_block_manager = self.gpu_block_manager if is_swap_in else self.cpu_block_manager
+    def _swap(self, seq_ids_list: list[int], is_swap_in: bool):
+        src_block_manager = (
+            self.cpu_block_manager if is_swap_in else self.gpu_block_manager
+        )
+        dst_block_manager = (
+            self.gpu_block_manager if is_swap_in else self.cpu_block_manager
+        )
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        seq_lengths = src_block_manager.get_num_allocated_blocks(seq_ids) * self.engine_config.block_size
-        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(seq_ids)
-        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lengths)
+        seq_lengths = (
+            src_block_manager.get_num_allocated_blocks(seq_ids)
+            * self.engine_config.block_size
+        )
+        src_block_ids = src_block_manager.gather_allocated_blocks_and_free(
+            seq_ids
+        )
+        dst_block_ids = dst_block_manager.allocate_blocks_for_seqs(
+            seq_ids, seq_lengths
+        )
         swiftllm_c.swap_blocks(
             src_block_ids.tolist(),
             dst_block_ids.tolist(),
             is_swap_in,
-
-            self.k_cache, self.v_cache,
-            self.k_swap, self.v_swap
+            self.k_cache,
+            self.v_cache,
+            self.k_swap,
+            self.v_swap,
         )
-        
+
     @torch.inference_mode()
-    def swap_in_seqs(
-        self,
-        seq_ids_list: list[int]
-    ):
+    def swap_in_seqs(self, seq_ids_list: list[int]):
         """
         Swap in (move blocks from CPU to GPU) the specified sequences.
         """
         self._swap(seq_ids_list, True)
-    
+
     @torch.inference_mode()
-    def swap_out_seqs(
-        self,
-        seq_ids_list: list[int]
-    ):
+    def swap_out_seqs(self, seq_ids_list: list[int]):
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """

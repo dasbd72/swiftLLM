@@ -1,10 +1,11 @@
-import time
 import argparse
+import time
+
 from transformers import AutoTokenizer
 
 import swiftllm
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.description = """
         An example script to demonstrate how to use the swiftllm model executor directly for inferencing without using the engine
@@ -13,23 +14,21 @@ if __name__ == '__main__':
         "--model-path",
         help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
         type=str,
-        required=True
+        required=True,
     )
     model_path = parser.parse_args().model_path
 
     engine_config = swiftllm.EngineConfig(
-        model_path = model_path,
-        use_dummy = False,
-        
-        block_size = 16,
-        gpu_mem_utilization = 0.99,
-        num_cpu_blocks = 0,
-        max_seqs_in_block_table = 128,
-        max_blocks_per_seq = 2048,
-
+        model_path=model_path,
+        use_dummy=False,
+        block_size=16,
+        gpu_mem_utilization=0.99,
+        num_cpu_blocks=0,
+        max_seqs_in_block_table=128,
+        max_blocks_per_seq=2048,
         # The following are not used in the offline example
-        max_batch_size = 16,
-        max_tokens_in_batch = 2048*16
+        max_batch_size=16,
+        max_tokens_in_batch=2048 * 16,
     )
 
     start_time = time.perf_counter()
@@ -44,7 +43,7 @@ if __name__ == '__main__':
 
     model_creation_time = time.perf_counter() - start_time
     print(f"Model creation time: {model_creation_time:.2f} seconds")
-    
+
     prompts = [
         "Life blooms like a flower, far away",
         "one two three four five",
@@ -56,11 +55,9 @@ if __name__ == '__main__':
     outputs = []
 
     # Prompt phase
-    input_ids = tokenizer(prompts)['input_ids']
+    input_ids = tokenizer(prompts)["input_ids"]
     prompt_phase_outputs = model.forward(
-        input_ids,
-        list(range(0, len(prompts))),
-        []
+        input_ids, list(range(0, len(prompts))), []
     )
     # print(tokenizer.batch_decode(prompt_phase_outputs, skip_special_tokens=True))
     outputs.append(prompt_phase_outputs)
@@ -73,11 +70,11 @@ if __name__ == '__main__':
         last_round_outputs = model.forward(
             [[x] for x in last_round_outputs],
             list(range(0, len(prompts))),
-            seq_lens
+            seq_lens,
         )
         # print(tokenizer.batch_decode(last_round_outputs, skip_special_tokens=True))
         outputs.append(last_round_outputs)
-    
+
     for i, prompt in enumerate(prompts):
         output_tokens = [x[i] for x in outputs]
         output_text = tokenizer.decode(output_tokens, skip_special_tokens=True)
