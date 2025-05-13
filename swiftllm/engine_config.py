@@ -1,12 +1,13 @@
-import dataclasses
 import argparse
+import dataclasses
+
 
 @dataclasses.dataclass
 class EngineConfig:
     """
     Configuration for the SwiftLLM engine.
     """
-    
+
     # Model loading parameters
     model_path: str
     use_dummy: bool
@@ -31,7 +32,11 @@ class EngineConfig:
             "--model-path",
             type=str,
             required=True,
-            help="Path to the model directory (currently SwiftLLM does not support downloading from HuggingFace, so please download in advance)",
+            help=(
+                "Path to the model directory (currently SwiftLLM does not"
+                " support downloading from HuggingFace, so please download in"
+                " advance)"
+            ),
         )
         parser.add_argument(
             "--use-dummy",
@@ -82,4 +87,3 @@ class EngineConfig:
             default=32768,
             help="Maximum number of tokens in a batch",
         )
-        
