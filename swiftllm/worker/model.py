@@ -5,7 +5,7 @@ from dataclasses import dataclass
 import swiftllm_c
 import torch
 
-from swiftllm.engine_config import EngineConfig
+from swiftllm.engine_config import EngineConfig, SchedulingStrategy
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.utils import GB
 from swiftllm.worker.block_manager import BlockManager
@@ -93,6 +93,9 @@ class LlamaModel:
         # Block manager
         self.cpu_block_manager = self.gpu_block_manager = None
 
+        # Forward streams
+        self.htod_stream = torch.cuda.Stream()
+
     @torch.inference_mode()
     def load_weights(self):
         """
@@ -104,23 +107,31 @@ class LlamaModel:
             torch.float16,
             self.engine_config.model_path,
             self.engine_config.use_dummy,
+            device=self.engine_config.weight_device,
         )
 
         # Initialize rotary embeddings
         self._init_to_get_rotary()
 
         # Initialize layers
-        self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
-        self.transformer_layers = [
-            LlamaTransformerLayer(
+        self.pre_layer = LlamaPreLayer(
+            self.model_config, self.weight, self.engine_config.weight_device
+        )
+        self.pre_layer.weight_to_gpu()
+        self.transformer_layers: list[LlamaTransformerLayer] = []
+        for layer_id in range(self.model_config.num_layers):
+            layer = LlamaTransformerLayer(
                 self.model_config,
                 self.engine_config,
                 self.weight.layers[layer_id],
+                self.engine_config.weight_device,
                 layer_id,
             )
-            for layer_id in range(self.model_config.num_layers)
-        ]
-        self.post_layer = LlamaPostLayer(self.model_config, self.weight)
+            self.transformer_layers.append(layer)
+        self.post_layer = LlamaPostLayer(
+            self.model_config, self.weight, self.engine_config.weight_device
+        )
+        self.post_layer.weight_to_gpu()
 
     @torch.inference_mode()
     def profile_num_blocks(self) -> int:
@@ -137,6 +148,9 @@ class LlamaModel:
         # Synthesis a prefill batch
         num_tokens = self.engine_config.max_tokens_in_batch
         batch_size = self.engine_config.max_batch_size
+        profile_scheduling_strategy = (
+            self.engine_config.profile_scheduling_strategy
+        )
         input_lens = [num_tokens // batch_size] * batch_size
         input_lens[-1] += num_tokens % batch_size
         input_ids = [[0 for _ in range(input_len)] for input_len in input_lens]
@@ -144,7 +158,12 @@ class LlamaModel:
         self.k_cache = self.v_cache = (
             None  # pylint: disable=attribute-defined-outside-init
         )
-        _ = self.prefill(input_ids, seq_ids, ignore_kvcache=True)
+        _ = self.prefill(
+            input_ids,
+            seq_ids,
+            ignore_kvcache=True,
+            scheduling_strategy=profile_scheduling_strategy,
+        )
         torch.cuda.synchronize()
 
         # peak_memory = torch.cuda.max_memory_allocated()
@@ -301,16 +320,87 @@ class LlamaModel:
         return output_tokens
 
     @torch.inference_mode()
-    def prefill(
+    def _prefill_offload_weight(
+        self,
+        args: _PrefillArguments,
+    ) -> torch.Tensor:
+        """
+        Run a prefill pass of the LlamaModel with weight offloading.
+        """
+        assert self.transformer_layers is not None
+        input_embds_list = [None]
+        residual_buf_list = [None]
+
+        def is_layer_id_in_range(layer_id: int):
+            return layer_id >= 0 and layer_id < self.model_config.num_layers
+
+        def prefill_load_weight(layer_id: int):
+            # Load the weight of the next layer
+            if not is_layer_id_in_range(layer_id):
+                return
+            with torch.cuda.stream(self.htod_stream):
+                self.transformer_layers[layer_id].weight_to_gpu()
+
+        def prefill_free_weight(layer_id: int):
+            # Free the weight of the current layer
+            self.transformer_layers[layer_id].weight_gpu_free()
+
+        def prefill_compute(layer_id: int):
+            # Compute the prefill pass of the current layer
+            block_table = (
+                self.gpu_block_manager.block_table
+                if not args.ignore_kvcache
+                else None
+            )
+            input_embds_list[0] = self.transformer_layers[layer_id].prefill(
+                input_embds_list[0],
+                residual_buf_list[0],
+                self.k_cache,
+                self.v_cache,
+                (
+                    self.gpu_block_manager.block_table
+                    if not args.ignore_kvcache
+                    else None
+                ),
+                args.softmax_scale,
+                args.seq_ids,
+                args.seq_start_locs,
+                args.seq_lens,
+                args.position_cos,
+                args.position_sin,
+                args.ignore_kvcache,
+            )
+
+        input_embds_list[0] = self.pre_layer.forward(args.input_ids)
+        residual_buf_list[0] = torch.zeros_like(input_embds_list[0])
+        # load the weight of the first layer
+        prefill_load_weight(0)
+        torch.cuda.synchronize()
+        for layer_id in range(self.model_config.num_layers):
+            # load the weight of the next layer
+            prefill_load_weight(layer_id + 1)
+            # compute the prefill pass of the current layer
+            prefill_compute(layer_id)
+            torch.cuda.synchronize()
+            # free the weight of the current layer
+            prefill_free_weight(layer_id)
+        input_embds_list[0] += residual_buf_list[0]
+        output_tokens = self.post_layer.prefill(
+            input_embds_list[0],
+            args.batch_size,
+            args.seq_start_locs,
+            args.seq_lens,
+        )
+        return output_tokens
+
+    @torch.inference_mode()
+    def _pre_prefill(
         self,
         input_ids_list: list[list[int]],  # [batch_size, *]
         seq_ids_list: list[int],  # [batch_size]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
         **kwargs,
     ):
-        """
-        Run a prefill pass of the LlamaModel.
-        """
         flattened_input_ids = list(itertools.chain(*input_ids_list))
         input_ids = torch.tensor(
             flattened_input_ids, dtype=torch.int32, device="cuda"
@@ -340,19 +430,45 @@ class LlamaModel:
         if not ignore_kvcache:
             self._allocate_blocks_for_seqs(seq_ids, seq_lens)
 
-        return self._prefill(
-            _PrefillArguments(
-                input_ids=input_ids,
-                batch_size=batch_size,
-                softmax_scale=softmax_scale,
-                seq_ids=seq_ids,
-                seq_start_locs=seq_start_locs,
-                seq_lens=seq_lens,
-                position_cos=position_cos,
-                position_sin=position_sin,
-                ignore_kvcache=ignore_kvcache,
-            ),
-        ).tolist()
+        return _PrefillArguments(
+            input_ids=input_ids,
+            batch_size=batch_size,
+            softmax_scale=softmax_scale,
+            seq_ids=seq_ids,
+            seq_start_locs=seq_start_locs,
+            seq_lens=seq_lens,
+            position_cos=position_cos,
+            position_sin=position_sin,
+            ignore_kvcache=ignore_kvcache,
+        )
+
+    @torch.inference_mode()
+    def prefill(
+        self,
+        input_ids_list: list[list[int]],  # [batch_size, *]
+        seq_ids_list: list[int],  # [batch_size]
+        ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        scheduling_strategy: SchedulingStrategy = "gpu",
+        **kwargs,
+    ):
+        """
+        Run a prefill pass of the LlamaModel.
+        """
+        args = self._pre_prefill(
+            input_ids_list,
+            seq_ids_list,
+            ignore_kvcache=ignore_kvcache,
+            **kwargs,
+        )
+        if scheduling_strategy == "gpu":
+            output_tokens = self._prefill(args).tolist()
+        elif scheduling_strategy == "offload-weight":
+            output_tokens = self._prefill_offload_weight(args).tolist()
+        else:
+            raise ValueError(
+                f"Unsupported scheduling strategy: {scheduling_strategy}"
+            )
+        return output_tokens
 
     @torch.inference_mode()
     def _decode(
@@ -390,7 +506,75 @@ class LlamaModel:
         return output_tokens
 
     @torch.inference_mode()
-    def decode(
+    def _decode_weight_offload(
+        self,
+        args: _DecodeArguments,
+    ) -> torch.Tensor:
+        """
+        Run a decode pass of the LlamaModel with weight offloading.
+        """
+        assert self.transformer_layers is not None
+        input_embds_list = [None]
+        residual_buf_list = [None]
+
+        def is_layer_id_in_range(layer_id: int):
+            return layer_id >= 0 and layer_id < self.model_config.num_layers
+
+        def decode_load_weight(layer_id: int):
+            # Load the weight of the next layer
+            if not is_layer_id_in_range(layer_id):
+                return
+            with torch.cuda.stream(self.htod_stream):
+                self.transformer_layers[layer_id].weight_to_gpu()
+
+        def decode_free_weight(layer_id: int):
+            # Free the weight of the current layer
+            self.transformer_layers[layer_id].weight_gpu_free()
+
+        def decode_compute(layer_id: int):
+            # Compute the decode pass of the current layer
+            block_table = (
+                self.gpu_block_manager.block_table
+                if not args.ignore_kvcache
+                else None
+            )
+            input_embds_list[0] = self.transformer_layers[layer_id].decode(
+                input_embds_list[0],
+                residual_buf_list[0],
+                self.k_cache,
+                self.v_cache,
+                block_table,
+                args.seq_block_size,
+                args.num_seq_blocks,
+                args.softmax_scale,
+                args.seq_ids,
+                args.seq_lens,
+                args.position_cos,
+                args.position_sin,
+                args.ignore_kvcache,
+            )
+
+        input_embds_list[0] = self.pre_layer.forward(args.input_ids)
+        residual_buf_list[0] = torch.zeros_like(input_embds_list[0])
+        # load the weight of the first layer
+        decode_load_weight(0)
+        torch.cuda.synchronize()
+        for layer_id in range(self.model_config.num_layers):
+            # load the weight of the next layer
+            decode_load_weight(layer_id + 1)
+            # compute the decode pass of the current layer
+            decode_compute(layer_id)
+            torch.cuda.synchronize()
+            # free the weight of the current layer
+            decode_free_weight(layer_id)
+        input_embds_list[0] += residual_buf_list[0]
+        output_tokens = self.post_layer.decode(
+            input_embds_list[0], args.batch_size
+        )
+        return output_tokens
+
+    @torch.inference_mode()
+    def _pre_decode(
         self,
         input_ids_list: list[list[int]],  # [batch_size, *]
         seq_ids_list: list[int],  # [batch_size]
@@ -398,9 +582,6 @@ class LlamaModel:
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
         **kwargs,
     ):
-        """
-        Run a decode pass of the LlamaModel.
-        """
         flattened_input_ids = list(itertools.chain(*input_ids_list))
         input_ids = torch.tensor(
             flattened_input_ids, dtype=torch.int32, device="cuda"
@@ -444,20 +625,47 @@ class LlamaModel:
             seq_block_size //= 2
         num_seq_blocks = (max_seq_len + seq_block_size - 1) // seq_block_size
 
-        return self._decode(
-            _DecodeArguments(
-                input_ids=input_ids,
-                batch_size=batch_size,
-                seq_block_size=seq_block_size,
-                num_seq_blocks=num_seq_blocks,
-                softmax_scale=softmax_scale,
-                seq_ids=seq_ids,
-                seq_lens=seq_lens,
-                position_cos=position_cos,
-                position_sin=position_sin,
-                ignore_kvcache=ignore_kvcache,
+        return _DecodeArguments(
+            input_ids=input_ids,
+            batch_size=batch_size,
+            seq_block_size=seq_block_size,
+            num_seq_blocks=num_seq_blocks,
+            softmax_scale=softmax_scale,
+            seq_ids=seq_ids,
+            seq_lens=seq_lens,
+            position_cos=position_cos,
+            position_sin=position_sin,
+            ignore_kvcache=ignore_kvcache,
+        )
+
+    def decode(
+        self,
+        input_ids_list: list[list[int]],  # [batch_size, *]
+        seq_ids_list: list[int],  # [batch_size]
+        seq_len_list: list[int],  # [batch_size]
+        ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        scheduling_strategy: SchedulingStrategy = "gpu",
+        **kwargs,
+    ):
+        """
+        Run a decode pass of the LlamaModel.
+        """
+        args = self._pre_decode(
+            input_ids_list,
+            seq_ids_list,
+            seq_len_list,
+            ignore_kvcache=ignore_kvcache,
+            **kwargs,
+        )
+        if scheduling_strategy == "gpu":
+            output_tokens = self._decode(args).tolist()
+        elif scheduling_strategy == "offload-weight":
+            output_tokens = self._decode_weight_offload(args).tolist()
+        else:
+            raise ValueError(
+                f"Unsupported scheduling strategy: {scheduling_strategy}"
             )
-        ).tolist()
+        return output_tokens
 
     def _swap(self, seq_ids_list: list[int], is_swap_in: bool):
         src_block_manager = (
@@ -509,3 +717,23 @@ class LlamaModel:
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
         self.gpu_block_manager.free_blocks_for_seqs(seq_ids)
         self.cpu_block_manager.free_blocks_for_seqs(seq_ids)
+
+    @torch.inference_mode()
+    def get_num_used_gpu_blocks(self) -> int:
+        """
+        Get the number of used GPU blocks.
+        """
+        return (
+            self.gpu_block_manager.num_blocks
+            - self.gpu_block_manager.num_free_blocks
+        )
+
+    @torch.inference_mode()
+    def get_num_used_cpu_blocks(self) -> int:
+        """
+        Get the number of used CPU blocks.
+        """
+        return (
+            self.cpu_block_manager.num_blocks
+            - self.cpu_block_manager.num_free_blocks
+        )

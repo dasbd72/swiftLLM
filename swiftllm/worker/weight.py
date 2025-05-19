@@ -55,9 +55,6 @@ class WeightBase:
             assert (
                 weight_value.shape == item.shape
             ), f"Shape of weight {item.key} does not match"
-            assert (
-                weight_value.device.type == "cuda"
-            ), f"Weight {item.key} is not on GPU"
             setattr(self, item.attr_name, weight_value.to(item.dtype))
         self._post_process_after_load(getter)
 
@@ -226,6 +223,7 @@ def load_weights(
     dtype: torch.dtype,
     model_path: str,
     use_dummy: bool = False,
+    device: str = "cuda",
 ) -> LlamaWeight:
     """
     Load weights from a given path
@@ -234,7 +232,7 @@ def load_weights(
 
         def weight_getter_dummy(item: RegisteredWeightItem):
             return torch.empty(
-                item.shape, dtype=item.dtype, device="cuda"
+                item.shape, dtype=item.dtype, device=device
             ).uniform_(-0.001, 0.001)
 
         getter = weight_getter_dummy
@@ -271,7 +269,7 @@ def load_weights(
                 file_path = os.path.join(model_path, file_name)
                 # For safetensor files, since "opening" it is cheap, we open it every time
                 with safetensors.safe_open(
-                    file_path, framework="pt", device="cuda"
+                    file_path, framework="pt", device=device
                 ) as f:
                     tensor = f.get_tensor(item.key)
                 return tensor.to(item.dtype)
@@ -308,7 +306,7 @@ def load_weights(
                 if file_path not in opened_files:
                     opened_files[file_path] = torch.load(
                         file_path,
-                        map_location="cuda",
+                        map_location=device,
                         mmap=True,
                         weights_only=False,
                     )

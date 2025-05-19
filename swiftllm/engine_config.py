@@ -1,5 +1,8 @@
 import argparse
 import dataclasses
+from typing import Literal
+
+SchedulingStrategy = Literal["gpu", "offload-weight"]
 
 
 @dataclasses.dataclass
@@ -22,6 +25,12 @@ class EngineConfig:
     # Scheduling-related parameters
     max_batch_size: int
     max_tokens_in_batch: int
+
+    # Offloading related parameters
+    weight_device: str = (
+        "cuda"  # The device to load the model on. This is only used for the initial loading of the model.
+    )
+    profile_scheduling_strategy: SchedulingStrategy = "gpu"
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):
@@ -82,4 +91,10 @@ class EngineConfig:
             type=int,
             default=32768,
             help="Maximum number of tokens in a batch",
+        )
+
+        parser.add_argument(
+            "--weight-device",
+            type=str,
+            help="Device that the model weight is loaded on (e.g., 'cpu', 'cuda')",
         )

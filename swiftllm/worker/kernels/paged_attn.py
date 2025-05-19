@@ -8,12 +8,12 @@ from swiftllm.model_config import LlamaModelConfig
 
 @triton.jit
 def _fwd_paged_attention_phase1(
-    mid_o: torch.Tensor,  # [num_decoding_seqs, num_q_heads, num_seq_blocks, head_dim], contiguous. num_seq_blocks = ceil(max_seq_len / seq_block_size)
+    mid_o: torch.Tensor,  # [num_decoding_seqs, num_q_heads, num_seq_blocks, head_dim], contiguous.
     mid_o_logexpsum: torch.Tensor,  # [num_decoding_seqs, num_q_heads, num_seq_blocks], contiguous
     q: torch.Tensor,  # [num_decoding_seqs, num_q_heads, head_dim], contiguous
     k_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
     v_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
-    block_table: torch.Tensor,  # [*, max_blocks_per_seq], contiguous
+    block_table: torch.Tensor,  # [num_seqs, max_blocks_per_seq], contiguous
     softmax_scale: tl.float16,
     decoding_seq_lens: torch.Tensor,  # [num_decoding_seqs], contiguous
     seq_ids: torch.Tensor,  # [num_decoding_seqs], contiguous
@@ -29,7 +29,7 @@ def _fwd_paged_attention_phase1(
     max_blocks_per_seq: tl.constexpr,
 ):
     # grid shape: [num_decoding_seqs, num_q_heads, num_seq_blocks]
-    my_batch_id = tl.program_id(0).to(tl.int64)
+    my_batch_id = tl.program_id(0)
     my_q_head_id = tl.program_id(1).to(tl.int64)
     my_seq_block_id = tl.program_id(2)
     my_kv_head_id = my_q_head_id // num_my_heads
@@ -235,15 +235,15 @@ def paged_attention(
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
     cur_layer: int,
-    o: torch.Tensor,  # [num_decoding_seqs, num_q_heads, head_dim]
+    o: torch.Tensor,  # [num_decoding_seqs, hidden_size]
 ):
     """Perform paged attention for decoding sequences. Operation is in-place.
 
     Args:
-        q: The query tensor of shape [num_decode_seqs, num_q_heads, head_dim].
+        q: The query tensor of shape [num_decoding_seqs, num_q_heads, head_dim].
         k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
         v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
-        block_table: The block table tensor of shape [*, max_blocks_per_seq].
+        block_table: The block table tensor of shape [num_seqs, max_blocks_per_seq].
         seq_block_size: The size of each sequence block.
         num_seq_blocks: The number of sequence blocks, which is equal to ceil(max_seq_len / seq_block_size).
         softmax_scale: The scale factor for softmax.
@@ -252,7 +252,7 @@ def paged_attention(
         model_config: The model configuration containing parameters.
         engine_config: The engine configuration containing parameters.
         cur_layer: The current layer index.
-        o: The output tensor of shape [num_decoding_seqs, num_q_heads, head_dim].
+        o: The output tensor of shape [num_decoding_seqs, hidden_size].
     """
     assert q.is_contiguous()
     assert k_cache.is_contiguous()
