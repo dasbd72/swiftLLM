@@ -9,16 +9,14 @@ from swiftllm.utils import cdiv
 
 @triton.jit
 def _fwd_kvcache_mgmt_prefill_kernel(
-    k_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
-    v_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
+    k_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
+    v_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
     k: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, head_dim], contiguous
     v: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, head_dim], contiguous
     block_table: torch.Tensor,  # [*, max_blocks_per_seq], contiguous
     seq_ids: torch.Tensor,  # [num_prefill_seqs], contiguous
     prefill_seq_start_locs: torch.Tensor,  # [num_prefill_seqs], contiguous
     prefill_seq_lens: torch.Tensor,  # [num_prefill_seqs], contiguous
-    cur_layer: int,
-    num_layers: tl.constexpr,
     num_kv_heads: tl.constexpr,
     block_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -48,10 +46,7 @@ def _fwd_kvcache_mgmt_prefill_kernel(
         + tl.arange(0, head_dim)[None, None, :]
     )
     offs_kvcache = (
-        (my_block_index * num_layers + cur_layer)
-        * num_kv_heads
-        * block_size
-        * head_dim
+        my_block_index * num_kv_heads * block_size * head_dim
         + (tl.arange(0, num_kv_heads) * block_size * head_dim)[None, :, None]
         + (tl.arange(0, block_size) * head_dim)[:, None, None]
         + tl.arange(0, head_dim)[None, None, :]
@@ -68,15 +63,13 @@ def _fwd_kvcache_mgmt_prefill_kernel(
 
 @triton.jit
 def _fwd_kvcache_mgmt_decoding_kernel(
-    k_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
-    v_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
+    k_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
+    v_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
     k: torch.Tensor,  # [num_decoding_seqs, num_kv_heads, head_dim], contiguous
     v: torch.Tensor,  # [num_decoding_seqs, num_kv_heads, head_dim], contiguous
     block_table: torch.Tensor,  # [*, max_blocks_per_seq], contiguous
     decoding_seq_ids: torch.Tensor,  # [num_decoding_seqs], contiguous
     decoding_seq_lens: torch.Tensor,  # [num_decoding_seqs], contiguous
-    cur_layer: int,
-    num_layers: tl.constexpr,
     num_kv_heads: tl.constexpr,
     block_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -98,10 +91,7 @@ def _fwd_kvcache_mgmt_decoding_kernel(
         + tl.arange(0, head_dim)[None, :]
     )
     offs_kvcache = (
-        (my_block_index * num_layers + cur_layer)
-        * num_kv_heads
-        * block_size
-        * head_dim
+        my_block_index * num_kv_heads * block_size * head_dim
         + (tl.arange(0, num_kv_heads) * block_size * head_dim)[:, None]
         + my_block_offset * head_dim
         + tl.arange(0, head_dim)[None, :]
@@ -122,7 +112,6 @@ def store_kvcache_prefill(
     seq_lens: torch.Tensor,
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
-    cur_layer: int,
 ):
     """
     Store the key/value cache to paged attention for prefill sequences.
@@ -130,15 +119,14 @@ def store_kvcache_prefill(
     Args:
         k: The key tensor of shape [num_prefill_tokens, num_kv_heads, head_dim].
         v: The value tensor of shape [num_prefill_tokens, num_kv_heads, head_dim].
-        k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
-        v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+        v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
         block_table: The block table tensor of shape [*, max_blocks_per_seq].
         seq_ids: The sequence IDs tensor of shape [num_seqs].
         seq_start_locs: The sequence start locations tensor of shape [num_seqs].
         seq_lens: The sequence lengths tensor of shape [num_seqs].
         model_config: The model configuration.
         engine_config: The engine configuration.
-        cur_layer: The current layer index.
     """
     assert k.is_contiguous()
     assert v.is_contiguous()
@@ -163,8 +151,6 @@ def store_kvcache_prefill(
         seq_ids,
         seq_start_locs,
         seq_lens,
-        cur_layer,
-        model_config.num_layers,
         model_config.num_kv_heads,
         engine_config.block_size,
         model_config.head_dim,
@@ -182,7 +168,6 @@ def store_kvcache_decode(
     seq_lens: torch.Tensor,
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
-    cur_layer: int,
 ):
     """
     Store the key/value cache to paged attention for decode sequences.
@@ -190,14 +175,13 @@ def store_kvcache_decode(
     Args:
         k: The key tensor of shape [num_decode_tokens, num_kv_heads, head_dim].
         v: The value tensor of shape [num_decode_tokens, num_kv_heads, head_dim].
-        k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
-        v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+        v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
         block_table: The block table tensor of shape [*, max_blocks_per_seq].
         seq_ids: The sequence IDs tensor of shape [num_seqs].
         seq_lens: The sequence lengths tensor of shape [num_seqs].
         model_config: The model configuration.
         engine_config: The engine configuration.
-        cur_layer: The current layer index.
     """
     assert k.is_contiguous()
     assert v.is_contiguous()
@@ -217,8 +201,6 @@ def store_kvcache_decode(
         block_table,
         seq_ids,
         seq_lens,
-        cur_layer,
-        model_config.num_layers,
         model_config.num_kv_heads,
         engine_config.block_size,
         model_config.head_dim,

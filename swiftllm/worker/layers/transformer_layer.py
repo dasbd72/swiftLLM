@@ -87,8 +87,8 @@ class LlamaTransformerLayer:
         Args:
             input_embds: The input embeddings tensor of shape [num_tokens, hidden_size].
             residual_buf: The residual buffer tensor of shape [num_tokens, hidden_size].
-            k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
-            v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+            k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+            v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
             block_table: The block table tensor of shape [num_seqs, max_blocks_per_seq].
             softmax_scale: The scale factor for softmax.
             seq_ids: The sequence IDs tensor of shape [num_seqs].
@@ -149,7 +149,6 @@ class LlamaTransformerLayer:
                 seq_lens,
                 self.model_config,
                 self.engine_config,
-                self.layer_id,
             )
 
         # Attention
@@ -236,8 +235,8 @@ class LlamaTransformerLayer:
         Args:
             input_embds: The input embeddings tensor of shape [num_tokens, hidden_size].
             residual_buf: The residual buffer tensor of shape [num_tokens, hidden_size].
-            k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
-            v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+            k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+            v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
             block_table: The block table tensor of shape [num_seqs, max_blocks_per_seq].
             seq_ids: The sequence IDs tensor of shape [num_seqs].
             seq_lens: The sequence lengths tensor of shape [num_seqs].
@@ -295,7 +294,6 @@ class LlamaTransformerLayer:
                 seq_lens,
                 self.model_config,
                 self.engine_config,
-                self.layer_id,
             )
         return q
 
@@ -317,8 +315,8 @@ class LlamaTransformerLayer:
 
         Args:
             q: The query tensor of shape [num_tokens, num_q_heads, head_dim].
-            k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
-            v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+            k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+            v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
             block_table: The block table tensor of shape [num_seqs, max_blocks_per_seq].
             seq_block_size: The block size of the sequence.
             num_seq_blocks: The number of blocks in the sequence.
@@ -339,7 +337,6 @@ class LlamaTransformerLayer:
             seq_lens,
             self.model_config,
             self.engine_config,
-            self.layer_id,
             o,
         )
 
@@ -400,8 +397,8 @@ class LlamaTransformerLayer:
         Args:
             input_embds: The input embeddings tensor of shape [num_tokens, hidden_size].
             residual_buf: The residual buffer tensor of shape [num_tokens, hidden_size].
-            k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
-            v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+            k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+            v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
             block_table: The block table tensor of shape [num_seqs, max_blocks_per_seq].
             seq_block_size: The block size of the sequence.
             num_seq_blocks: The number of blocks in the sequence.
