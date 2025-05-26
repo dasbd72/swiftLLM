@@ -39,6 +39,12 @@ class LlamaTransformerLayer:
             "up_gate_proj",
             "down_proj",
         ]
+        self.weight_num_chunks = None
+        self.weight_chunk_size = None
+        self.weight_num_params = 0
+        for name in self.weight_names:
+            weight_attr: torch.Tensor = getattr(weight, name)
+            self.weight_num_params += weight_attr.numel()
         self.weight_cpu = {name: None for name in self.weight_names}
         if weight_device == "cpu":
             for name in self.weight_names:
@@ -57,6 +63,56 @@ class LlamaTransformerLayer:
                     name,
                     self.weight_cpu[name].to("cuda", non_blocking=True),
                 )
+
+    def weight_to_gpu_chunked_init(self, num_chunks: int):
+        """
+        Initialize chunk loading settings
+        """
+        if self.weight_device == "cpu":
+            self.weight_num_chunks = num_chunks
+            self.weight_chunk_size = (
+                self.weight_num_params + num_chunks - 1
+            ) // num_chunks
+            for name in self.weight_names:
+                cpu_weight_attr: torch.Tensor = self.weight_cpu[name]
+                data = torch.empty_like(
+                    cpu_weight_attr, dtype=cpu_weight_attr.dtype, device="cuda"
+                )
+                setattr(self.weight, name, data)
+
+    def weight_to_gpu_chunked(self, chunk_id: int):
+        """
+        Load weights to GPU in chunks if they are on CPU
+        """
+        if self.weight_device == "cpu":
+            weight_num_params_scanned = 0
+            weight_num_params_start = chunk_id * self.weight_chunk_size
+            weight_num_params_end = min(
+                (chunk_id + 1) * self.weight_chunk_size,
+                self.weight_num_params,
+            )
+            for name in self.weight_names:
+                cpu_weight_attr: torch.Tensor = self.weight_cpu[name]
+                gpu_weight_attr: torch.Tensor = getattr(self.weight, name)
+                weight_num_params_this_attr = cpu_weight_attr.numel()
+                if (
+                    weight_num_params_scanned + weight_num_params_this_attr
+                    > weight_num_params_start
+                ):
+                    # This attribute has some params in this chunk
+                    start = max(
+                        0, weight_num_params_start - weight_num_params_scanned
+                    )
+                    end = min(
+                        weight_num_params_this_attr,
+                        weight_num_params_end - weight_num_params_scanned,
+                    )
+                    if start < end:
+                        gpu_weight_attr.view(-1)[start:end].copy_(
+                            cpu_weight_attr.view(-1)[start:end],
+                            non_blocking=True,
+                        )
+                weight_num_params_scanned += weight_num_params_this_attr
 
     def weight_gpu_free(self):
         """
