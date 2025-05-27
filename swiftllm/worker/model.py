@@ -252,6 +252,7 @@ class LlamaModel:
         seq_ids_list: list[int],  # [batch_size]
         decoding_seq_lens_list: list[int],  # [num_decoding_seqs]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        **kwargs,
     ) -> list[int]:
         """
         Run a forward pass of the LlamaModel.
