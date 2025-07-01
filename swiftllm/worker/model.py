@@ -1,3 +1,4 @@
+import functools
 import itertools
 import math
 from dataclasses import dataclass
@@ -106,6 +107,7 @@ class LlamaModel:
 
         # Forward streams
         self.htod_stream = torch.cuda.Stream()
+        self.dtoh_stream = torch.cuda.Stream()
 
     @torch.inference_mode()
     def load_weights(self):
@@ -689,6 +691,188 @@ class LlamaModel:
         return output_tokens
 
     @torch.inference_mode()
+    def _decode_zigzag(
+        self,
+        args_list: list[
+            _DecodeArguments
+        ],  # List of _DecodeArguments for each micro batch
+    ) -> list[torch.Tensor]:
+        """
+        Run a decode pass of the LlamaModel in zigzag scheduling.
+        """
+        num_micro_batches = len(args_list)
+        input_embds_list = [None for _ in range(num_micro_batches)]
+        residual_buf_list = [None for _ in range(num_micro_batches)]
+        # Initialize output_tokens_list with None for each micro batch
+        output_tokens_list = [None for _ in range(num_micro_batches)]
+
+        def is_layer_id_in_range(layer_id: int):
+            return 0 <= layer_id < len(self.transformer_layers)
+
+        def zigzag_decorator(func):
+            """
+            A decorator that advances layer/mb IDs and validates the layer ID.
+            """
+
+            @functools.wraps(func)
+            def wrapper(layer_id: int, mb_id: int, *args, **kwargs):
+                # 1. Execute the common pre-processing steps
+                if mb_id >= num_micro_batches:
+                    mb_id = mb_id - num_micro_batches
+                    layer_id += 1
+                elif mb_id < 0:
+                    mb_id = num_micro_batches + mb_id
+                    layer_id -= 1
+
+                # 2. Perform the check
+                if not is_layer_id_in_range(layer_id):
+                    return None
+
+                # 3. If checks pass, run the original function with the updated values
+                return func(layer_id, mb_id, *args, **kwargs)
+
+            return wrapper
+
+        def zigzag_load_weight(layer_id: int):
+            # Load the weight of the first layer
+            if not is_layer_id_in_range(layer_id):
+                return
+            with torch.cuda.stream(self.htod_stream):
+                self.transformer_layers[layer_id].weight_to_gpu()
+
+        def zigzag_load_weight_chunked_init(layer_id: int):
+            # Initialize chunked weight loading
+            if not is_layer_id_in_range(layer_id):
+                return
+            self.transformer_layers[layer_id].weight_to_gpu_chunked_init(
+                num_micro_batches
+            )
+
+        @zigzag_decorator
+        def zigzag_load_weight_chunked(layer_id: int, mb_id: int):
+            # Load the weight of the next layer in chunks
+            with torch.cuda.stream(self.htod_stream):
+                self.transformer_layers[layer_id].weight_to_gpu_chunked(mb_id)
+
+        def zigzag_free_weight(layer_id: int):
+            # Free the weight of the current layer
+            self.transformer_layers[layer_id].weight_gpu_free()
+
+        @zigzag_decorator
+        def zigzag_load_cache(layer_id: int, mb_id: int):
+            # Load the cache of the next micro batch
+            if args_list[mb_id].ignore_kvcache:
+                return
+            with torch.cuda.stream(self.htod_stream):
+                self._swap_layer(
+                    layer_id,
+                    args_list[mb_id].seq_ids.tolist(),
+                    is_swap_in=True,
+                    is_pinned=True,
+                )
+
+        @zigzag_decorator
+        def zigzag_store_cache(layer_id: int, mb_id: int):
+            # Store the cache of the previous micro batch
+            if args_list[mb_id].ignore_kvcache:
+                return
+            with torch.cuda.stream(self.dtoh_stream):
+                self._swap_layer(
+                    layer_id,
+                    args_list[mb_id].seq_ids.tolist(),
+                    is_swap_in=False,
+                    is_pinned=True,
+                )
+
+        @zigzag_decorator
+        def zigzag_compute(layer_id: int, mb_id: int):
+            # Compute the current micro batch
+            block_table = (
+                self.gpu_block_managers[layer_id].block_table
+                if not args_list[mb_id].ignore_kvcache
+                else None
+            )
+            if self.k_cache is None:
+                k_cache = None
+                v_cache = None
+            else:
+                l, r = (
+                    layer_id * self.num_blocks_per_layer,
+                    (layer_id + 1) * self.num_blocks_per_layer,
+                )
+                k_cache = self.k_cache[l:r]
+                v_cache = self.v_cache[l:r]
+            input_embds_list[mb_id] = self.transformer_layers[layer_id].decode(
+                input_embds_list[mb_id],
+                residual_buf_list[mb_id],
+                k_cache,
+                v_cache,
+                block_table,
+                args_list[mb_id].seq_block_size,
+                args_list[mb_id].num_seq_blocks,
+                args_list[mb_id].softmax_scale,
+                args_list[mb_id].seq_ids,
+                args_list[mb_id].seq_lens,
+                args_list[mb_id].position_cos,
+                args_list[mb_id].position_sin,
+                args_list[mb_id].ignore_kvcache,
+            )
+
+        # pre layer computation
+        for mb_id in range(num_micro_batches):
+            input_embds_list[mb_id] = self.pre_layer.forward(
+                args_list[mb_id].input_ids
+            )
+            residual_buf_list[mb_id] = torch.zeros_like(
+                input_embds_list[mb_id]
+            )
+
+        # transformer layers computation
+        # load the weight of the first layer
+        zigzag_load_weight(0)
+        # load the cache of the first micro batch
+        zigzag_load_cache(0, 0)
+        # synchronize
+        torch.cuda.synchronize()  # Ensure initial loads are complete
+
+        for layer_id in range(len(self.transformer_layers)):
+            # load the weight of the next layer
+            zigzag_load_weight_chunked_init(layer_id + 1)
+
+            for mb_id in range(num_micro_batches):
+                # load the weight chunk of the next layer
+                zigzag_load_weight_chunked(layer_id + 1, mb_id)
+
+                # store the cache of the previous micro batch
+                zigzag_store_cache(layer_id, mb_id - 1)
+                # load the cache of the next micro batch
+                zigzag_load_cache(layer_id, mb_id + 1)
+
+                # compute the current micro batch
+                zigzag_compute(layer_id, mb_id)
+
+                # synchronize all devices
+                torch.cuda.synchronize()
+
+            # free the weight of the current layer
+            zigzag_free_weight(layer_id)
+
+        # Store the cache of the last micro batch
+        zigzag_store_cache(
+            len(self.transformer_layers) - 1, num_micro_batches - 1
+        )
+        torch.cuda.synchronize()  # Ensure all operations are complete before post-layer
+
+        # post layer computation
+        for mb_id in range(num_micro_batches):
+            input_embds_list[mb_id] += residual_buf_list[mb_id]
+            output_tokens_list[mb_id] = self.post_layer.decode(
+                input_embds_list[mb_id],
+                args_list[mb_id].batch_size,
+            )
+        return output_tokens_list
+
+    @torch.inference_mode()
     def _pre_decode(
         self,
         input_ids_list: list[list[int]],  # [batch_size, *]
@@ -786,7 +970,7 @@ class LlamaModel:
                 output_tokens = self._decode(args).tolist()
             elif scheduling_strategy == "offload-weight":
                 output_tokens = self._decode_weight_offload(args).tolist()
-        elif scheduling_strategy in []:
+        elif scheduling_strategy in ["zigzag"]:
             # Runs in micro batches
             batch_size = len(input_ids_list)
             micro_batch_ranges = [
@@ -807,9 +991,7 @@ class LlamaModel:
                 )
                 for micro_batch_start, micro_batch_end in micro_batch_ranges
             ]
-            raise NotImplementedError(
-                "Micro-batch scheduling strategy is not implemented yet."
-            )
+            output_tokens_list = self._decode_zigzag(args_list)
             output_tokens = list(
                 itertools.chain.from_iterable(
                     [
