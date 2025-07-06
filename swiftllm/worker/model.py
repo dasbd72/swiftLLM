@@ -76,14 +76,12 @@ class LlamaModel:
         self._init_to_get_rotary()
 
         # Initialize layers
-        decoding_piggyback_stream = torch.cuda.Stream()
         self.pre_layer = LlamaPreLayer(self.model_config, self.weight)
         self.transformer_layers = [
             LlamaTransformerLayer(
                 self.model_config,
                 self.engine_config,
                 self.weight.layers[layer_id],
-                decoding_piggyback_stream,
                 layer_id,
             )
             for layer_id in range(self.model_config.num_layers)
@@ -262,6 +260,14 @@ class LlamaModel:
 
         This function is intended to be called by the server.
         """
+
+        assert len(input_ids_list) == len(
+            seq_ids_list
+        ), "The length of input_ids_list and seq_ids_list must be the same."
+        if decoding_seq_lens_list:
+            assert len(input_ids_list) == len(
+                decoding_seq_lens_list
+            ), "Piggyback is not supported, please make sure the seq_ids_list and decoding_seq_lens_list have the same length."
 
         num_prefill_seqs = len(input_ids_list) - len(decoding_seq_lens_list)
         flattened_input_ids = list(itertools.chain(*input_ids_list))

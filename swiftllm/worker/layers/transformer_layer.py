@@ -20,13 +20,11 @@ class LlamaTransformerLayer:
         model_config: LlamaModelConfig,
         engine_config: EngineConfig,
         weight: LlamaTransformerLayerWeight,
-        decoding_piggyback_stream: torch.cuda.Stream,
         layer_id: int,
     ):
         self.model_config = model_config
         self.engine_config = engine_config
         self.weight = weight
-        self.decoding_piggyback_stream = decoding_piggyback_stream
         self.layer_id = layer_id
 
     def forward(
@@ -121,22 +119,18 @@ class LlamaTransformerLayer:
                 )
         if infer_state.num_decoding_seqs > 0:
             assert not infer_state.ignore_kvcache
-            with torch.cuda.stream(self.decoding_piggyback_stream):
-                torch.cuda.current_stream().wait_event(store_kvcache_event)
-                paged_attention(
-                    q[infer_state.num_prefill_tokens :, :, :],
-                    k_cache,
-                    v_cache,
-                    block_table,
-                    self.model_config,
-                    self.engine_config,
-                    infer_state,
-                    self.layer_id,
-                    o[infer_state.num_prefill_tokens :, :],
-                )
-                event = torch.cuda.Event()
-                event.record()
-            torch.cuda.default_stream().wait_event(event)
+            torch.cuda.current_stream().wait_event(store_kvcache_event)
+            paged_attention(
+                q[infer_state.num_prefill_tokens :, :, :],
+                k_cache,
+                v_cache,
+                block_table,
+                self.model_config,
+                self.engine_config,
+                infer_state,
+                self.layer_id,
+                o[infer_state.num_prefill_tokens :, :],
+            )
 
         # Output GEMM
         o = linear(o, self.weight.o_proj)  # [num_total_tokens, hidden_size]
