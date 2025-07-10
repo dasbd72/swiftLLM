@@ -5,7 +5,6 @@ import triton.language as tl
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
 from swiftllm.utils import cdiv
-from swiftllm.worker.infer_state import LlamaInferState
 
 
 @triton.jit
@@ -112,71 +111,116 @@ def _fwd_kvcache_mgmt_decoding_kernel(
     tl.store(v_cache + offs_kvcache, tl.load(v + offs_kv))
 
 
-def store_kvcache(
+def store_kvcache_prefill(
     k: torch.Tensor,
     v: torch.Tensor,
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
+    seq_ids: torch.Tensor,
+    seq_start_locs: torch.Tensor,
+    seq_lens: torch.Tensor,
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
-    infer_state: LlamaInferState,
     cur_layer: int,
 ):
+    """
+    Store the key/value cache to paged attention for prefill sequences.
+
+    Args:
+        k: The key tensor of shape [num_prefill_tokens, num_kv_heads, head_dim].
+        v: The value tensor of shape [num_prefill_tokens, num_kv_heads, head_dim].
+        k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        block_table: The block table tensor of shape [*, max_blocks_per_seq].
+        seq_ids: The sequence IDs tensor of shape [num_seqs].
+        seq_start_locs: The sequence start locations tensor of shape [num_seqs].
+        seq_lens: The sequence lengths tensor of shape [num_seqs].
+        model_config: The model configuration.
+        engine_config: The engine configuration.
+        cur_layer: The current layer index.
+    """
     assert k.is_contiguous()
     assert v.is_contiguous()
     assert k_cache.is_contiguous()
     assert v_cache.is_contiguous()
     assert block_table.is_contiguous()
-    assert infer_state.seq_ids.is_contiguous()
-    assert infer_state.decoding_seq_lens.is_contiguous()
+    assert seq_ids.is_contiguous()
+    assert seq_lens.is_contiguous()
 
-    if infer_state.num_prefill_seqs > 0:
-        grid = (
-            infer_state.num_prefill_seqs,
-            cdiv(infer_state.max_prefill_len, engine_config.block_size),
-        )
-        _fwd_kvcache_mgmt_prefill_kernel[grid](
-            k_cache,
-            v_cache,
-            k,
-            v,
-            block_table,
-            infer_state.seq_ids,
-            infer_state.prefill_seq_start_locs,
-            infer_state.prefill_seq_lens,
-            cur_layer,
-            model_config.num_layers,
-            model_config.num_kv_heads,
-            engine_config.block_size,
-            model_config.head_dim,
-            engine_config.max_blocks_per_seq,
-        )
+    num_seqs = seq_ids.shape[0]
+    max_seq_len = seq_lens.max().item()
+    grid = (
+        num_seqs,
+        cdiv(max_seq_len, engine_config.block_size),
+    )
+    _fwd_kvcache_mgmt_prefill_kernel[grid](
+        k_cache,
+        v_cache,
+        k,
+        v,
+        block_table,
+        seq_ids,
+        seq_start_locs,
+        seq_lens,
+        cur_layer,
+        model_config.num_layers,
+        model_config.num_kv_heads,
+        engine_config.block_size,
+        model_config.head_dim,
+        engine_config.max_blocks_per_seq,
+    )
 
-    if infer_state.num_decoding_seqs > 0:
-        grid = (infer_state.num_decoding_seqs,)
-        _fwd_kvcache_mgmt_decoding_kernel[grid](
-            k_cache,
-            v_cache,
-            k[infer_state.num_prefill_tokens :, :, :],
-            v[infer_state.num_prefill_tokens :, :, :],
-            block_table,
-            infer_state.seq_ids[infer_state.num_prefill_seqs :],
-            infer_state.decoding_seq_lens,
-            cur_layer,
-            model_config.num_layers,
-            model_config.num_kv_heads,
-            engine_config.block_size,
-            model_config.head_dim,
-            engine_config.max_blocks_per_seq,
-        )
 
-        # for my_batch_id in range(infer_state.num_decoding_seqs):
-        #     my_k = k[infer_state.num_prefill_tokens+my_batch_id]    # [num_kv_heads, head_dim]
-        #     my_v = v[infer_state.num_prefill_tokens+my_batch_id]    # [num_kv_heads, head_dim]
-        #     my_new_token_pos = infer_state.decoding_seq_lens[my_batch_id] - 1
-        #     my_block_index = block_table[infer_state.seq_ids[infer_state.num_prefill_seqs+my_batch_id]][my_new_token_pos // engine_config.block_size]
-        #     my_block_offset = my_new_token_pos % engine_config.block_size
+def store_kvcache_decode(
+    k: torch.Tensor,
+    v: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_ids: torch.Tensor,
+    seq_lens: torch.Tensor,
+    model_config: LlamaModelConfig,
+    engine_config: EngineConfig,
+    cur_layer: int,
+):
+    """
+    Store the key/value cache to paged attention for decode sequences.
 
-        #     k_cache[my_block_index][cur_layer][:, my_block_offset, :] = my_k
-        #     v_cache[my_block_index][cur_layer][:, my_block_offset, :] = my_v
+    Args:
+        k: The key tensor of shape [num_decode_tokens, num_kv_heads, head_dim].
+        v: The value tensor of shape [num_decode_tokens, num_kv_heads, head_dim].
+        k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        block_table: The block table tensor of shape [*, max_blocks_per_seq].
+        seq_ids: The sequence IDs tensor of shape [num_seqs].
+        seq_lens: The sequence lengths tensor of shape [num_seqs].
+        model_config: The model configuration.
+        engine_config: The engine configuration.
+        cur_layer: The current layer index.
+    """
+    assert k.is_contiguous()
+    assert v.is_contiguous()
+    assert k_cache.is_contiguous()
+    assert v_cache.is_contiguous()
+    assert block_table.is_contiguous()
+    assert seq_ids.is_contiguous()
+    assert seq_lens.is_contiguous()
+
+    num_seqs = seq_ids.shape[0]
+    grid = (num_seqs,)
+    _fwd_kvcache_mgmt_decoding_kernel[grid](
+        k_cache,
+        v_cache,
+        k,
+        v,
+        block_table,
+        seq_ids,
+        seq_lens,
+        cur_layer,
+        model_config.num_layers,
+        model_config.num_kv_heads,
+        engine_config.block_size,
+        model_config.head_dim,
+        engine_config.max_blocks_per_seq,
+    )

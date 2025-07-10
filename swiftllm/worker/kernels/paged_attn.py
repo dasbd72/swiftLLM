@@ -4,7 +4,6 @@ import triton.language as tl
 
 from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.infer_state import LlamaInferState
 
 
 @triton.jit
@@ -228,24 +227,46 @@ def paged_attention(
     k_cache: torch.Tensor,
     v_cache: torch.Tensor,
     block_table: torch.Tensor,
+    seq_block_size: int,
+    num_seq_blocks: int,
+    softmax_scale: float,
+    seq_ids: torch.Tensor,
+    seq_lens: torch.Tensor,
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
-    infer_state: LlamaInferState,
     cur_layer: int,
     o: torch.Tensor,  # [num_decoding_seqs, num_q_heads, head_dim]
 ):
+    """Perform paged attention for decoding sequences. Operation is in-place.
+
+    Args:
+        q: The query tensor of shape [num_decode_seqs, num_q_heads, head_dim].
+        k_cache: The key cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        v_cache: The value cache tensor of shape [num_blocks, num_layers, num_kv_heads, block_size, head_dim].
+        block_table: The block table tensor of shape [*, max_blocks_per_seq].
+        seq_block_size: The size of each sequence block.
+        num_seq_blocks: The number of sequence blocks, which is equal to ceil(max_seq_len / seq_block_size).
+        softmax_scale: The scale factor for softmax.
+        seq_ids: The sequence IDs tensor of shape [num_decoding_seqs].
+        seq_lens: The sequence lengths tensor of shape [num_decoding_seqs].
+        model_config: The model configuration containing parameters.
+        engine_config: The engine configuration containing parameters.
+        cur_layer: The current layer index.
+        o: The output tensor of shape [num_decoding_seqs, num_q_heads, head_dim].
+    """
     assert q.is_contiguous()
     assert k_cache.is_contiguous()
     assert v_cache.is_contiguous()
     assert block_table.is_contiguous()
-    assert infer_state.seq_block_size % engine_config.block_size == 0
+    assert seq_block_size % engine_config.block_size == 0
     assert o.is_contiguous()
 
+    num_seqs = q.shape[0]
     mid_o = torch.empty(
         (
-            infer_state.num_decoding_seqs,
+            num_seqs,
             model_config.num_q_heads,
-            infer_state.num_seq_blocks,
+            num_seq_blocks,
             model_config.head_dim,
         ),
         device=q.device,
@@ -253,18 +274,18 @@ def paged_attention(
     )
     mid_o_logexpsum = torch.empty(
         (
-            infer_state.num_decoding_seqs,
+            num_seqs,
             model_config.num_q_heads,
-            infer_state.num_seq_blocks,
+            num_seq_blocks,
         ),
         device=q.device,
         dtype=torch.float32,
     )
 
     grid = (
-        infer_state.num_decoding_seqs,
+        num_seqs,
         model_config.num_q_heads,
-        infer_state.num_seq_blocks,
+        num_seq_blocks,
     )
     _fwd_paged_attention_phase1[grid](
         mid_o,
@@ -280,10 +301,10 @@ def paged_attention(
         #    and use `exp2` instead.
         # 2. Some optimizations are disabled while using `exp` in a loop, see
         #    https://github.com/triton-lang/triton/issues/2961
-        infer_state.softmax_scale * 1.442695040888963,
-        infer_state.decoding_seq_lens,
-        infer_state.seq_ids[infer_state.num_prefill_seqs :],
-        infer_state.num_seq_blocks,
+        softmax_scale * 1.442695040888963,
+        seq_lens,
+        seq_ids,
+        num_seq_blocks,
         cur_layer,
         model_config.num_layers,
         model_config.num_q_heads,
@@ -291,57 +312,20 @@ def paged_attention(
         model_config.num_q_heads // model_config.num_kv_heads,
         engine_config.block_size,
         model_config.head_dim,
-        infer_state.seq_block_size,
+        seq_block_size,
         engine_config.max_blocks_per_seq,
         num_warps=1,
         num_stages=4,
     )
 
-    grid = (infer_state.num_decoding_seqs, model_config.num_q_heads)
+    grid = (num_seqs, model_config.num_q_heads)
     _fwd_paged_attention_phase2[grid](
         mid_o,
         mid_o_logexpsum,
         o,
-        infer_state.decoding_seq_lens,
+        seq_lens,
         model_config.num_q_heads,
         model_config.head_dim,
-        infer_state.num_seq_blocks,
-        infer_state.seq_block_size,
+        num_seq_blocks,
+        seq_block_size,
     )
-
-    # from swiftllm.utils import cdiv
-    # for my_batch_id in range(infer_state.num_decoding_seqs):
-    #     my_q = q[my_batch_id]   # [num_q_heads, head_dim]
-    #     my_block_table = block_table[infer_state.seq_ids[infer_state.num_prefill_seqs+my_batch_id]]
-    #     my_num_blocks = cdiv(infer_state.decoding_seq_lens[my_batch_id], engine_config.block_size)
-    #     my_k_blocks = []
-    #     my_v_blocks = []
-    #     for block_id in range(my_num_blocks):
-    #         block_index = my_block_table[block_id]
-    #         my_k_blocks.append(k_cache[block_index][cur_layer])
-    #         my_v_blocks.append(v_cache[block_index][cur_layer])
-    #     my_k = torch.cat(my_k_blocks, dim=1)   # [num_kv_heads, *, head_dim]
-    #     my_v = torch.cat(my_v_blocks, dim=1)   # [num_kv_heads, *, head_dim]
-    #     my_k = my_k.repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, dim=0)   # [num_q_heads, *, head_dim]
-    #     my_v = my_v.repeat_interleave(model_config.num_q_heads // model_config.num_kv_heads, dim=0)   # [num_q_heads, *, head_dim]
-    #     my_q = my_q.reshape(model_config.num_q_heads, 1, model_config.head_dim)
-
-    #     my_q = my_q.to(torch.float32)
-    #     my_k = my_k.to(torch.float32)
-    #     my_v = my_v.to(torch.float32)
-
-    #     my_attn_score = torch.bmm(my_q, my_k.transpose(1, 2)).squeeze()   # [num_q_heads, *]
-    #     my_attn_score = my_attn_score * infer_state.softmax_scale
-    #     # print(my_v[0])
-    #     # print(my_q[0])
-    #     my_attn_score = torch.where(
-    #         torch.arange(my_attn_score.shape[1], device=my_attn_score.device) < infer_state.decoding_seq_lens[my_batch_id],
-    #         my_attn_score,
-    #         torch.full_like(my_attn_score, float('-1e20'))
-    #     )
-    #     # print(my_attn_score)
-    #     my_attn_score = torch.softmax(my_attn_score, dim=1)   # [num_q_heads, *]
-    #     my_attn_score = my_attn_score.unsqueeze(1)   # [num_q_heads, 1, *]
-
-    #     res = torch.bmm(my_attn_score, my_v).squeeze(1)   # [num_q_heads, head_dim]
-    #     o[my_batch_id] = res.reshape(-1).to(torch.float16)

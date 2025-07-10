@@ -2,9 +2,7 @@ import torch
 import triton
 import triton.language as tl
 
-from swiftllm.engine_config import EngineConfig
 from swiftllm.model_config import LlamaModelConfig
-from swiftllm.worker.infer_state import LlamaInferState
 
 
 @triton.jit
@@ -142,10 +140,26 @@ def prefill_attention(
     k: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, head_dim]
     v: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, head_dim]
     o: torch.Tensor,  # [num_prefill_tokens, num_q_heads, head_dim]
+    softmax_scale: float,
+    seq_ids: torch.Tensor,
+    seq_start_locs: torch.Tensor,
+    seq_lens: torch.Tensor,
     model_config: LlamaModelConfig,
-    engine_config: EngineConfig,
-    infer_state: LlamaInferState,
 ):
+    """
+    Prefill attention kernel for gpus not able to run flash attention.
+
+    Args:
+        q: The query tensor of shape [num_prefill_tokens, num_q_heads, head_dim].
+        k: The key tensor of shape [num_prefill_tokens, num_kv_heads, head_dim].
+        v: The value tensor of shape [num_prefill_tokens, num_kv_heads, head_dim].
+        o: The output tensor of shape [num_prefill_tokens, num_q_heads, head_dim].
+        softmax_scale: The scale factor for the softmax operation.
+        seq_ids: The sequence IDs tensor of shape [num_seqs].
+        seq_start_locs: The sequence start locations tensor of shape [num_seqs].
+        seq_lens: The sequence lengths tensor of shape [num_seqs].
+        model_config: The model configuration object.
+    """
     if "V100" in torch.cuda.get_device_name(0):
         BLOCK_Q = 128
         BLOCK_K = 64
@@ -162,26 +176,23 @@ def prefill_attention(
         BLOCK_Q = 64
         BLOCK_K = 64
 
-    # Here we reduce BLOCK_Q and BLOCK_K, since that when max_prefill_len is
+    # Here we reduce BLOCK_Q and BLOCK_K, since that when max_seq_len is
     # small, large block size introduces unnecessary computation when computing
     # the attention score.
     # note: We restrict BLOCK_Q and BLOCK_K >= 16 due to a limitation proposed by tl.dot
-    BLOCK_Q = min(
-        BLOCK_Q, triton.next_power_of_2(max(infer_state.max_prefill_len, 16))
-    )
-    BLOCK_K = min(
-        BLOCK_K, triton.next_power_of_2(max(infer_state.max_prefill_len, 16))
-    )
+    max_seq_len = seq_lens.max().item()
+    BLOCK_Q = min(BLOCK_Q, triton.next_power_of_2(max(max_seq_len, 16)))
+    BLOCK_K = min(BLOCK_K, triton.next_power_of_2(max(max_seq_len, 16)))
 
     # Please refer to `paged_attn.py` for the reason of multiplying softmax_scale
     # by log2(e)
-    softmax_scale2 = infer_state.softmax_scale * 1.442695040888963
+    softmax_scale2 = softmax_scale * 1.442695040888963
 
     assert BLOCK_Q % BLOCK_K == 0
     grid = (
-        infer_state.num_prefill_seqs,
+        seq_ids.shape[0],
         model_config.num_q_heads,
-        triton.cdiv(infer_state.max_prefill_len, BLOCK_Q),
+        triton.cdiv(max_seq_len, BLOCK_Q),
     )
     num_warps = 8
     _fwd_prefill_attention[grid](
@@ -190,8 +201,8 @@ def prefill_attention(
         k,
         v,
         softmax_scale2,
-        infer_state.prefill_seq_start_locs,
-        infer_state.prefill_seq_lens,
+        seq_start_locs,
+        seq_lens,
         model_config.num_q_heads,
         model_config.num_kv_heads,
         model_config.num_q_heads // model_config.num_kv_heads,

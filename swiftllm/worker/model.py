@@ -1,5 +1,6 @@
 import itertools
 import math
+from dataclasses import dataclass
 
 import swiftllm_c
 import torch
@@ -10,10 +11,43 @@ from swiftllm.utils import GB
 from swiftllm.worker.block_manager import BlockManager
 from swiftllm.worker.weight import load_weights
 
-from .infer_state import LlamaInferState
 from .layers.post_layer import LlamaPostLayer
 from .layers.pre_layer import LlamaPreLayer
 from .layers.transformer_layer import LlamaTransformerLayer
+
+
+@dataclass
+class _PrefillArguments:
+    """Class to hold arguments for the _prefill method.
+    This is created to make managing micro-batch arguments easier.
+    """
+
+    input_ids: torch.Tensor
+    batch_size: int
+    softmax_scale: float
+    seq_ids: torch.Tensor
+    seq_start_locs: torch.Tensor
+    seq_lens: torch.Tensor
+    position_cos: torch.Tensor
+    position_sin: torch.Tensor
+    ignore_kvcache: bool
+
+
+@dataclass
+class _DecodeArguments:
+    """Class to hold arguments for the _decode method.
+    This is created to make managing micro-batch arguments easier."""
+
+    input_ids: torch.Tensor
+    batch_size: int
+    seq_block_size: int
+    num_seq_blocks: int
+    softmax_scale: float
+    seq_ids: torch.Tensor
+    seq_lens: torch.Tensor
+    position_cos: torch.Tensor
+    position_sin: torch.Tensor
+    ignore_kvcache: bool
 
 
 class LlamaModel:
@@ -110,7 +144,7 @@ class LlamaModel:
         self.k_cache = self.v_cache = (
             None  # pylint: disable=attribute-defined-outside-init
         )
-        _ = self.forward(input_ids, seq_ids, [], ignore_kvcache=True)
+        _ = self.prefill(input_ids, seq_ids, ignore_kvcache=True)
         torch.cuda.synchronize()
 
         # peak_memory = torch.cuda.max_memory_allocated()
@@ -215,119 +249,173 @@ class LlamaModel:
         self._cos_cached = torch.cos(freqs).to(torch.float16)
         self._sin_cached = torch.sin(freqs).to(torch.float16)
 
-    @torch.inference_mode()
-    def _forward(
+    def _allocate_blocks_for_seqs(
         self,
-        input_ids: torch.Tensor,  # [total_token_num]
-        infer_state: LlamaInferState,
+        seq_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """
+        Allocate blocks for the given sequences.
+        This is a helper function to allocate blocks for the sequences in prefill and decode.
+
+        Arg:
+            seq_ids torch.Tensor: A tensor of sequence IDs, shape [num_seqs].
+            seq_lens torch.Tensor: A tensor of sequence lengths, shape [num_seqs].
+        """
+        self.gpu_block_manager.allocate_blocks_for_seqs(seq_ids, seq_lens)
+
+    @torch.inference_mode()
+    def _prefill(
+        self,
+        args: _PrefillArguments,
     ) -> torch.Tensor:
         """
-        Run a forward pass of the LlamaModel.
+        Run a prefill pass of the LlamaModel.
         """
-        input_embds = self.pre_layer.forward(input_ids)
+        assert self.transformer_layers is not None
+        input_embds = self.pre_layer.forward(args.input_ids)
         residual_buf = torch.zeros_like(input_embds)
         for layer in self.transformer_layers:
-            input_embds = layer.forward(
+            input_embds = layer.prefill(
                 input_embds,
                 residual_buf,
                 self.k_cache,
                 self.v_cache,
                 (
                     self.gpu_block_manager.block_table
-                    if not infer_state.ignore_kvcache
+                    if not args.ignore_kvcache
                     else None
                 ),
-                infer_state,
+                args.softmax_scale,
+                args.seq_ids,
+                args.seq_start_locs,
+                args.seq_lens,
+                args.position_cos,
+                args.position_sin,
+                args.ignore_kvcache,
             )
         input_embds += residual_buf
-        output_tokens = self.post_layer.forward(input_embds, infer_state)
+        output_tokens = self.post_layer.prefill(
+            input_embds, args.batch_size, args.seq_start_locs, args.seq_lens
+        )
         return output_tokens
 
     @torch.inference_mode()
-    def forward(
+    def prefill(
         self,
         input_ids_list: list[list[int]],  # [batch_size, *]
         seq_ids_list: list[int],  # [batch_size]
-        decoding_seq_lens_list: list[int],  # [num_decoding_seqs]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
         **kwargs,
-    ) -> list[int]:
+    ):
         """
-        Run a forward pass of the LlamaModel.
-
-        This function is a wrapper of the `_forward` function. It prepares the infer_state
-        and calls the `_forward` function.
-
-        This function is intended to be called by the server.
+        Run a prefill pass of the LlamaModel.
         """
-
-        assert len(input_ids_list) == len(
-            seq_ids_list
-        ), "The length of input_ids_list and seq_ids_list must be the same."
-        if decoding_seq_lens_list:
-            assert len(input_ids_list) == len(
-                decoding_seq_lens_list
-            ), "Piggyback is not supported, please make sure the seq_ids_list and decoding_seq_lens_list have the same length."
-
-        num_prefill_seqs = len(input_ids_list) - len(decoding_seq_lens_list)
         flattened_input_ids = list(itertools.chain(*input_ids_list))
-        seq_lengths_list = [
-            len(seq) for seq in input_ids_list[:num_prefill_seqs]
-        ] + decoding_seq_lens_list
-
-        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
-        seq_lengths = torch.tensor(
-            seq_lengths_list, dtype=torch.int32, device="cuda"
+        input_ids = torch.tensor(
+            flattened_input_ids, dtype=torch.int32, device="cuda"
         )
-
         batch_size = len(input_ids_list)
-        num_tokens = len(flattened_input_ids)
-
-        prefill_seq_lens_list = seq_lengths_list[:num_prefill_seqs]
-        prefill_seq_lens = torch.tensor(
-            prefill_seq_lens_list, dtype=torch.int32, device="cuda"
+        softmax_scale = self.model_config.head_dim**-0.5
+        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
+        seq_len_list = [len(seq) for seq in input_ids_list]
+        seq_lens = torch.tensor(seq_len_list, dtype=torch.int32, device="cuda")
+        seq_start_locs = (
+            torch.cumsum(seq_lens, dim=0, dtype=torch.int32) - seq_lens
         )
-        prefill_start_locs = (
-            torch.cumsum(prefill_seq_lens, dim=0, dtype=torch.int32)
-            - prefill_seq_lens
+        position_indices = torch.concat(
+            [
+                torch.arange(
+                    0,
+                    seq_len,
+                    device="cuda",
+                    dtype=torch.int32,
+                )
+                for seq_len in seq_len_list
+            ]
         )
-        max_prefill_len = (
-            max(prefill_seq_lens_list) if prefill_seq_lens_list else 0
-        )
-
-        decoding_seq_lens = torch.tensor(
-            decoding_seq_lens_list, dtype=torch.int32, device="cuda"
-        )
-        max_decoding_len = (
-            max(decoding_seq_lens_list) if decoding_seq_lens_list else 0
-        )
-
-        position_indices = torch.cat(
-            (
-                (
-                    torch.concat(
-                        [
-                            torch.arange(
-                                0,
-                                prefill_seq_len,
-                                device="cuda",
-                                dtype=torch.int32,
-                            )
-                            for prefill_seq_len in prefill_seq_lens_list
-                        ]
-                    )
-                    if prefill_seq_lens_list
-                    else torch.empty(0, device="cuda", dtype=torch.int32)
-                ),
-                decoding_seq_lens - 1,
-            ),
-            dim=0,
-        )
+        position_cos = self._cos_cached[position_indices]
+        position_sin = self._sin_cached[position_indices]
 
         if not ignore_kvcache:
-            self.gpu_block_manager.allocate_blocks_for_seqs(
-                seq_ids, seq_lengths
+            self._allocate_blocks_for_seqs(seq_ids, seq_lens)
+
+        return self._prefill(
+            _PrefillArguments(
+                input_ids=input_ids,
+                batch_size=batch_size,
+                softmax_scale=softmax_scale,
+                seq_ids=seq_ids,
+                seq_start_locs=seq_start_locs,
+                seq_lens=seq_lens,
+                position_cos=position_cos,
+                position_sin=position_sin,
+                ignore_kvcache=ignore_kvcache,
+            ),
+        ).tolist()
+
+    @torch.inference_mode()
+    def _decode(
+        self,
+        args: _DecodeArguments,
+    ) -> torch.Tensor:
+        """
+        Run a decode pass of the LlamaModel.
+        """
+        assert self.transformer_layers is not None
+        input_embds = self.pre_layer.forward(args.input_ids)
+        residual_buf = torch.zeros_like(input_embds)
+        for layer in self.transformer_layers:
+            input_embds = layer.decode(
+                input_embds,
+                residual_buf,
+                self.k_cache,
+                self.v_cache,
+                (
+                    self.gpu_block_manager.block_table
+                    if not args.ignore_kvcache
+                    else None
+                ),
+                args.seq_block_size,
+                args.num_seq_blocks,
+                args.softmax_scale,
+                args.seq_ids,
+                args.seq_lens,
+                args.position_cos,
+                args.position_sin,
+                args.ignore_kvcache,
             )
+        input_embds += residual_buf
+        output_tokens = self.post_layer.decode(input_embds, args.batch_size)
+        return output_tokens
+
+    @torch.inference_mode()
+    def decode(
+        self,
+        input_ids_list: list[list[int]],  # [batch_size, *]
+        seq_ids_list: list[int],  # [batch_size]
+        seq_len_list: list[int],  # [batch_size]
+        ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        **kwargs,
+    ):
+        """
+        Run a decode pass of the LlamaModel.
+        """
+        flattened_input_ids = list(itertools.chain(*input_ids_list))
+        input_ids = torch.tensor(
+            flattened_input_ids, dtype=torch.int32, device="cuda"
+        )
+        batch_size = len(input_ids_list)
+        softmax_scale = self.model_config.head_dim**-0.5
+        seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
+        seq_lens = torch.tensor(seq_len_list, dtype=torch.int32, device="cuda")
+        max_seq_len = seq_lens.max().item()
+        position_indices = seq_lens - 1
+        position_cos = self._cos_cached[position_indices]
+        position_sin = self._sin_cached[position_indices]
+
+        if not ignore_kvcache:
+            self._allocate_blocks_for_seqs(seq_ids, seq_lens)
 
         # Select the seq_block_size
         #
@@ -345,50 +433,30 @@ class LlamaModel:
         # sum(cdiv(decoding_seq_lens, seq_block_size))
 
         seq_block_size = 2048
-        decoding_seq_lens_sum = sum(decoding_seq_lens_list)
+        decoding_seq_lens_sum = sum(seq_len_list)
         while (
             self.model_config.num_kv_heads
             * (decoding_seq_lens_sum / seq_block_size)
             < 1024
             and seq_block_size // 2 >= 64
-            and max_decoding_len / (seq_block_size // 2) <= 128
+            and max_seq_len / (seq_block_size // 2) <= 128
         ):
             seq_block_size //= 2
+        num_seq_blocks = (max_seq_len + seq_block_size - 1) // seq_block_size
 
-        infer_state = LlamaInferState(
-            batch_size=batch_size,
-            num_tokens=num_tokens,
-            seq_ids=seq_ids,
-            softmax_scale=self.model_config.head_dim**-0.5,
-            num_prefill_seqs=num_prefill_seqs,
-            num_prefill_tokens=num_tokens - (batch_size - num_prefill_seqs),
-            prefill_seq_start_locs=prefill_start_locs,
-            prefill_seq_start_locs_with_end=torch.cat(
-                [
-                    prefill_start_locs,
-                    torch.tensor(
-                        [num_tokens], dtype=torch.int32, device="cuda"
-                    ),
-                ]
-            ),
-            prefill_seq_lens=prefill_seq_lens,
-            max_prefill_len=max_prefill_len,
-            num_decoding_seqs=batch_size - num_prefill_seqs,
-            decoding_seq_lens=decoding_seq_lens,
-            max_decoding_len=max_decoding_len,
-            seq_block_size=seq_block_size,
-            num_seq_blocks=(max_decoding_len + seq_block_size - 1)
-            // seq_block_size,
-            position_cos=self._cos_cached[position_indices],
-            position_sin=self._sin_cached[position_indices],
-            ignore_kvcache=ignore_kvcache,
-        )
-
-        return self._forward(
-            torch.tensor(
-                flattened_input_ids, dtype=torch.int32, device="cuda"
-            ),
-            infer_state,
+        return self._decode(
+            _DecodeArguments(
+                input_ids=input_ids,
+                batch_size=batch_size,
+                seq_block_size=seq_block_size,
+                num_seq_blocks=num_seq_blocks,
+                softmax_scale=softmax_scale,
+                seq_ids=seq_ids,
+                seq_lens=seq_lens,
+                position_cos=position_cos,
+                position_sin=position_sin,
+                ignore_kvcache=ignore_kvcache,
+            )
         ).tolist()
 
     def _swap(self, seq_ids_list: list[int], is_swap_in: bool):

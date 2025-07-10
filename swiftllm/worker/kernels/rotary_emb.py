@@ -2,8 +2,6 @@ import torch
 import triton
 import triton.language as tl
 
-from swiftllm.worker.infer_state import LlamaInferState
-
 
 @triton.jit
 def _fwd_rotary_embedding(
@@ -54,7 +52,8 @@ def _fwd_rotary_embedding(
 def rotary_embedding_inplace(
     q: torch.Tensor,  # [num_tokens, num_q_heads, head_dim]
     k: torch.Tensor,  # [num_tokens, num_k_heads, head_dim]
-    infer_state: LlamaInferState,
+    position_cos: torch.Tensor,  # [num_tokens, head_dim//2]
+    position_sin: torch.Tensor,  # [num_tokens, head_dim//2]
 ):
     num_tokens = q.shape[0]
     num_q_heads = q.shape[1]
@@ -64,8 +63,8 @@ def rotary_embedding_inplace(
     _fwd_rotary_embedding[grid](
         q,
         k,
-        infer_state.position_cos,
-        infer_state.position_sin,
+        position_cos,
+        position_sin,
         num_q_heads,
         num_kv_heads,
         num_q_heads // num_kv_heads,
