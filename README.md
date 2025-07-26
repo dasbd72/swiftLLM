@@ -77,7 +77,7 @@ And then comes the installation:
 - `cd` into the repo (`cd swiftLLM`) and install other dependencies via `pip install -r requirements.txt`.
 - PyTorch may install a stable version of [OpenAI Triton](https://github.com/triton-lang/triton) for you. If you like to use the nightly version for the cutting-edge performance but with potential issues, you may uninstall it and install the nightly version.
 - Run `pip install -e .` to install SwiftLLM into your environment.
-- Install some C-bindings via `pip install -e csrc`
+- Install some C-bindings via `pip install -e csrc --no-build-isolation`
 
 Here are some examples:
 

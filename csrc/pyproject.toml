@@ -1,0 +1,15 @@
+[project]
+name = "swiftllm-c"
+version = "0.0.1"
+description = "Some C++/CUDA sources for SwiftLLM."
+authors = [{ name = "Shengyu Liu", email = "shengyu.liu@stu.pku.edu.cn" }]
+readme = "README.md"
+requires-python = ">=3.9"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Programming Language :: C++",
+]
+
+[build-system]
+requires = ["setuptools>=61.0", "torch", "wheel"]
+build-backend = "setuptools.build_meta"
