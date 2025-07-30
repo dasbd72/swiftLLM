@@ -276,14 +276,8 @@ class LlamaTransformerLayer:
         self,
         input_embds: torch.Tensor,  # [num_tokens, hidden_size]
         residual_buf: torch.Tensor,  # [num_tokens, hidden_size]
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        block_table: torch.Tensor,
-        seq_ids: torch.Tensor,
-        seq_lens: torch.Tensor,
         position_cos: torch.Tensor,
         position_sin: torch.Tensor,
-        ignore_kvcache: bool,
     ) -> torch.Tensor:
         """
         Decode phase of the transformer layer, before attention.
@@ -291,16 +285,12 @@ class LlamaTransformerLayer:
         Args:
             input_embds: The input embeddings tensor of shape [num_tokens, hidden_size].
             residual_buf: The residual buffer tensor of shape [num_tokens, hidden_size].
-            k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
-            v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
-            block_table: The block table tensor of shape [num_seqs, max_blocks_per_seq].
-            seq_ids: The sequence IDs tensor of shape [num_seqs].
-            seq_lens: The sequence lengths tensor of shape [num_seqs].
             position_cos: The cosine values for rotary embedding of shape [num_tokens, head_dim//2].
             position_sin: The sine values for rotary embedding of shape [num_tokens, head_dim//2].
-            ignore_kvcache: Whether to ignore the key-value cache.
         Returns:
             q: The query tensor of shape [num_tokens, num_q_heads, head_dim].
+            k: The key tensor of shape [num_tokens, num_kv_heads, head_dim].
+            v: The value tensor of shape [num_tokens, num_kv_heads, head_dim].
         """
 
         # (fused) Add last layer's residual, and perform RMSNorm
@@ -339,19 +329,41 @@ class LlamaTransformerLayer:
         # Rotary emb
         rotary_embedding_inplace(q, k, position_cos, position_sin)
 
-        if not ignore_kvcache:
-            store_kvcache_decode(
-                k,
-                v,
-                k_cache,
-                v_cache,
-                block_table,
-                seq_ids,
-                seq_lens,
-                self.model_config,
-                self.engine_config,
-            )
-        return q
+        return q, k, v
+
+    def decode_store_kvcache(
+        self,
+        k: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
+        v: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_ids: torch.Tensor,
+        seq_lens: torch.Tensor,
+    ):
+        """
+        Decode phase of the transformer layer, to store key-value cache.
+
+        Args:
+            k: The key tensor of shape [num_tokens, num_kv_heads, head_dim].
+            v: The value tensor of shape [num_tokens, num_kv_heads, head_dim].
+            k_cache: The key cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+            v_cache: The value cache tensor of shape [num_blocks, num_kv_heads, block_size, head_dim].
+            block_table: The block table tensor of shape [num_seqs, max_blocks_per_seq].
+            seq_ids: The sequence IDs tensor of shape [num_seqs].
+            seq_lens: The sequence lengths tensor of shape [num_seqs].
+        """
+        store_kvcache_decode(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            block_table,
+            seq_ids,
+            seq_lens,
+            self.model_config,
+            self.engine_config,
+        )
 
     def decode_attn(
         self,
@@ -468,18 +480,24 @@ class LlamaTransformerLayer:
             ffn_out: The output of the feed-forward network after attention, of shape [num_tokens, hidden_size].
         """
         # Decode pre-attention
-        q = self.decode_pre_attn(
+        q, k, v = self.decode_pre_attn(
             input_embds,
             residual_buf,
-            k_cache,
-            v_cache,
-            block_table,
-            seq_ids,
-            seq_lens,
             position_cos,
             position_sin,
-            ignore_kvcache,
         )
+
+        # Store key-value cache
+        if not ignore_kvcache:
+            self.decode_store_kvcache(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                block_table,
+                seq_ids,
+                seq_lens,
+            )
 
         # Decode attention
         o = torch.empty(
