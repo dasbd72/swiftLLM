@@ -31,6 +31,7 @@ class EngineConfig:
         "cuda"  # The device to load the model on. This is only used for the initial loading of the model.
     )
     profile_scheduling_strategy: SchedulingStrategy = "gpu"
+    max_micro_batch_size: int | None = None
 
     @staticmethod
     def add_cli_args(parser: argparse.ArgumentParser):

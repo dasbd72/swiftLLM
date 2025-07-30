@@ -326,6 +326,7 @@ class LlamaModel:
         self,
         seq_ids: torch.Tensor,
         seq_lens: torch.Tensor,
+        host_pinned_kvcache: bool = False,
     ):
         """
         Allocate blocks for the given sequences.
@@ -334,6 +335,7 @@ class LlamaModel:
         Arg:
             seq_ids torch.Tensor: A tensor of sequence IDs, shape [num_seqs].
             seq_lens torch.Tensor: A tensor of sequence lengths, shape [num_seqs].
+            host_pinned_kvcache bool: If True, allocate kv cache on CPU, otherwise on GPU.
         """
         for layer_id in range(self.model_config.num_layers):
             # kv cache should be only on one device
@@ -362,6 +364,12 @@ class LlamaModel:
                     seq_ids, seq_lens
                 )
             elif is_on_pinned:
+                self.pinned_block_managers[layer_id].allocate_blocks_for_seqs(
+                    seq_ids, seq_lens
+                )
+            elif host_pinned_kvcache:
+                # If no blocks are allocated, but host_pinned_kvcache is True,
+                # allocate blocks on pinned memory
                 self.pinned_block_managers[layer_id].allocate_blocks_for_seqs(
                     seq_ids, seq_lens
                 )
@@ -493,6 +501,7 @@ class LlamaModel:
         input_ids_list: list[list[int]],  # [batch_size, *]
         seq_ids_list: list[int],  # [batch_size]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        host_pinned_kvcache: bool = False,  # Allocate kv cache on CPU
         **kwargs,
     ):
         flattened_input_ids = list(itertools.chain(*input_ids_list))
@@ -522,7 +531,9 @@ class LlamaModel:
         position_sin = self._sin_cached[position_indices]
 
         if not ignore_kvcache:
-            self._allocate_blocks_for_seqs(seq_ids, seq_lens)
+            self._allocate_blocks_for_seqs(
+                seq_ids, seq_lens, host_pinned_kvcache=host_pinned_kvcache
+            )
 
         return _PrefillArguments(
             input_ids=input_ids,
@@ -684,6 +695,7 @@ class LlamaModel:
         seq_ids_list: list[int],  # [batch_size]
         seq_len_list: list[int],  # [batch_size]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        host_pinned_kvcache: bool = False,  # Allocate kv cache on CPU
         **kwargs,
     ):
         flattened_input_ids = list(itertools.chain(*input_ids_list))
@@ -700,7 +712,9 @@ class LlamaModel:
         position_sin = self._sin_cached[position_indices]
 
         if not ignore_kvcache:
-            self._allocate_blocks_for_seqs(seq_ids, seq_lens)
+            self._allocate_blocks_for_seqs(
+                seq_ids, seq_lens, host_pinned_kvcache=host_pinned_kvcache
+            )
 
         # Select the seq_block_size
         #
@@ -749,22 +763,61 @@ class LlamaModel:
         seq_len_list: list[int],  # [batch_size]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
         scheduling_strategy: SchedulingStrategy = "gpu",
+        micro_batch_size: (
+            int | None
+        ) = None,  # The number of sequences in a micro batch, None means no micro batch
         **kwargs,
     ):
         """
         Run a decode pass of the LlamaModel.
         """
-        args = self._pre_decode(
-            input_ids_list,
-            seq_ids_list,
-            seq_len_list,
-            ignore_kvcache=ignore_kvcache,
-            **kwargs,
-        )
-        if scheduling_strategy == "gpu":
-            output_tokens = self._decode(args).tolist()
-        elif scheduling_strategy == "offload-weight":
-            output_tokens = self._decode_weight_offload(args).tolist()
+        if scheduling_strategy in [
+            "gpu",
+            "offload-weight",
+        ]:
+            args = self._pre_decode(
+                input_ids_list,
+                seq_ids_list,
+                seq_len_list,
+                ignore_kvcache=ignore_kvcache,
+                **kwargs,
+            )
+            if scheduling_strategy == "gpu":
+                output_tokens = self._decode(args).tolist()
+            elif scheduling_strategy == "offload-weight":
+                output_tokens = self._decode_weight_offload(args).tolist()
+        elif scheduling_strategy in []:
+            # Runs in micro batches
+            batch_size = len(input_ids_list)
+            micro_batch_ranges = [
+                (
+                    micro_batch_start,
+                    min(micro_batch_start + micro_batch_size, batch_size),
+                )
+                for micro_batch_start in range(0, batch_size, micro_batch_size)
+            ]
+            args_list = [
+                self._pre_decode(
+                    input_ids_list[micro_batch_start:micro_batch_end],
+                    seq_ids_list[micro_batch_start:micro_batch_end],
+                    seq_len_list[micro_batch_start:micro_batch_end],
+                    ignore_kvcache=ignore_kvcache,
+                    host_pinned_kvcache=True,
+                    **kwargs,
+                )
+                for micro_batch_start, micro_batch_end in micro_batch_ranges
+            ]
+            raise NotImplementedError(
+                "Micro-batch scheduling strategy is not implemented yet."
+            )
+            output_tokens = list(
+                itertools.chain.from_iterable(
+                    [
+                        output_tokens.tolist()
+                        for output_tokens in output_tokens_list
+                    ]
+                )
+            )
         else:
             raise ValueError(
                 f"Unsupported scheduling strategy: {scheduling_strategy}"
