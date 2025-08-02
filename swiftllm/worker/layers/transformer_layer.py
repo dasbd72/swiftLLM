@@ -52,19 +52,17 @@ class LlamaTransformerLayer:
                 setattr(weight, name, None)
         self.layer_id = layer_id
 
-    def weight_to_gpu(self):
+    def weight_to_gpu(self, buffer: torch.Tensor = None):
         """
         Load weights to GPU if they are on CPU
         """
         if self.weight_device == "cpu":
-            for name in self.weight_names:
-                setattr(
-                    self.weight,
-                    name,
-                    self.weight_cpu[name].to("cuda", non_blocking=True),
-                )
+            self.weight_to_gpu_chunked_init(1, buffer=buffer)
+            self.weight_to_gpu_chunked(0)
 
-    def weight_to_gpu_chunked_init(self, num_chunks: int):
+    def weight_to_gpu_chunked_init(
+        self, num_chunks: int, buffer: torch.Tensor = None
+    ):
         """
         Initialize chunk loading settings
         """
@@ -73,11 +71,29 @@ class LlamaTransformerLayer:
             self.weight_chunk_size = (
                 self.weight_num_params + num_chunks - 1
             ) // num_chunks
+            if buffer is not None:
+                # Use the provided buffer to load weights
+                assert len(buffer.shape) == 1, "Buffer must be a 1D tensor."
+                assert (
+                    buffer.numel() >= self.weight_num_params
+                ), "Provided buffer is too small to hold all weights."
+                assert buffer.dtype == torch.float16, "Buffer must be float16."
+                assert buffer.device.type == "cuda", "Buffer must be on CUDA."
+            else:
+                # Allocate a new buffer to load weights
+                buffer = torch.empty(
+                    self.weight_num_params,
+                    dtype=torch.float16,
+                    device="cuda",
+                )
+            weight_num_params_start = 0
             for name in self.weight_names:
                 cpu_weight_attr: torch.Tensor = self.weight_cpu[name]
-                data = torch.empty_like(
-                    cpu_weight_attr, dtype=cpu_weight_attr.dtype, device="cuda"
-                )
+                data = buffer[
+                    weight_num_params_start : weight_num_params_start
+                    + cpu_weight_attr.numel()
+                ].view_as(cpu_weight_attr)
+                weight_num_params_start += cpu_weight_attr.numel()
                 setattr(self.weight, name, data)
 
     def weight_to_gpu_chunked(self, chunk_id: int):
