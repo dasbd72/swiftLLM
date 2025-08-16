@@ -1,3 +1,4 @@
+import swiftllm_c
 import torch
 import triton
 import triton.language as tl
@@ -136,26 +137,31 @@ def store_kvcache_prefill(
     assert seq_ids.is_contiguous()
     assert seq_lens.is_contiguous()
 
-    num_seqs = seq_ids.shape[0]
-    max_seq_len = seq_lens.max().item()
-    grid = (
-        num_seqs,
-        cdiv(max_seq_len, engine_config.block_size),
-    )
-    _fwd_kvcache_mgmt_prefill_kernel[grid](
-        k_cache,
-        v_cache,
-        k,
-        v,
-        block_table,
-        seq_ids,
-        seq_start_locs,
-        seq_lens,
-        model_config.num_kv_heads,
-        engine_config.block_size,
-        model_config.head_dim,
-        engine_config.max_blocks_per_seq,
-    )
+    if k_cache.device.type == "cuda":
+        num_seqs = seq_ids.shape[0]
+        max_seq_len = seq_lens.max().item()
+        grid = (
+            num_seqs,
+            cdiv(max_seq_len, engine_config.block_size),
+        )
+        _fwd_kvcache_mgmt_prefill_kernel[grid](
+            k_cache,
+            v_cache,
+            k,
+            v,
+            block_table,
+            seq_ids,
+            seq_start_locs,
+            seq_lens,
+            model_config.num_kv_heads,
+            engine_config.block_size,
+            model_config.head_dim,
+            engine_config.max_blocks_per_seq,
+        )
+    else:
+        raise NotImplementedError(
+            "Prefill kv-cache management is not implemented for CPU."
+        )
 
 
 def store_kvcache_decode(
@@ -190,19 +196,36 @@ def store_kvcache_decode(
     assert block_table.is_contiguous()
     assert seq_ids.is_contiguous()
     assert seq_lens.is_contiguous()
+    # Supports both CPU to CPU and GPU to GPU for decoding
+    assert k.device.type in ["cuda", "cpu"]
+    assert k.device.type == v.device.type
+    assert k_cache.device.type in ["cuda", "cpu"]
+    assert k_cache.device.type == v_cache.device.type
+    assert k.device.type == k_cache.device.type
 
-    num_seqs = seq_ids.shape[0]
-    grid = (num_seqs,)
-    _fwd_kvcache_mgmt_decoding_kernel[grid](
-        k_cache,
-        v_cache,
-        k,
-        v,
-        block_table,
-        seq_ids,
-        seq_lens,
-        model_config.num_kv_heads,
-        engine_config.block_size,
-        model_config.head_dim,
-        engine_config.max_blocks_per_seq,
-    )
+    if k_cache.device.type == "cuda":
+        num_seqs = seq_ids.shape[0]
+        grid = (num_seqs,)
+        _fwd_kvcache_mgmt_decoding_kernel[grid](
+            k_cache,
+            v_cache,
+            k,
+            v,
+            block_table,
+            seq_ids,
+            seq_lens,
+            model_config.num_kv_heads,
+            engine_config.block_size,
+            model_config.head_dim,
+            engine_config.max_blocks_per_seq,
+        )
+    else:
+        swiftllm_c.cpu_store_kvcache_decode(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            block_table,
+            seq_ids,
+            seq_lens,
+        )

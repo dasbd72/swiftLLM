@@ -2,7 +2,7 @@ import argparse
 import dataclasses
 from typing import Literal
 
-SchedulingStrategy = Literal["gpu", "offload-weight", "zigzag"]
+SchedulingStrategy = Literal["gpu", "offload-weight", "zigzag", "cgopipe"]
 
 
 @dataclasses.dataclass

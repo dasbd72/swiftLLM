@@ -109,6 +109,12 @@ class LlamaModel:
         self.htod_stream = torch.cuda.Stream()
         self.dtoh_stream = torch.cuda.Stream()
 
+        # CGOPipe streams
+        self.htod_stream = torch.cuda.Stream()
+        self.cpu_stream = torch.cuda.Stream()
+        self.dtoh_stream = torch.cuda.Stream()
+        self.gpu_stream = torch.cuda.Stream()
+
     @torch.inference_mode()
     def load_weights(self):
         """
@@ -873,6 +879,383 @@ class LlamaModel:
         return output_tokens_list
 
     @torch.inference_mode()
+    def _decode_cgopipe(
+        self,
+        args_list: list[
+            _DecodeArguments
+        ],  # List of _DecodeArguments for each micro batch
+    ) -> list[torch.Tensor]:
+        """
+        Run a decode pass of the LlamaModel in cgopipe scheduling.
+        """
+        num_micro_batches = len(args_list)
+        seq_len_list = [
+            len(args_list[mb_id].seq_ids) for mb_id in range(num_micro_batches)
+        ]
+        input_embds_list = [None for _ in range(num_micro_batches)]
+        residual_buf_list = [None for _ in range(num_micro_batches)]
+        inter_q_gpu_list = [None for _ in range(num_micro_batches)]
+        inter_q_cpu_list = [
+            torch.empty(
+                (
+                    seq_len_list[mb_id],
+                    self.model_config.num_q_heads,
+                    self.model_config.head_dim,
+                ),
+                dtype=torch.float16,
+                pin_memory=True,
+            )
+            for mb_id in range(num_micro_batches)
+        ]
+        inter_k_gpu_list = [None for _ in range(num_micro_batches)]
+        inter_v_gpu_list = [None for _ in range(num_micro_batches)]
+        inter_k_cpu_list = [
+            torch.empty(
+                (
+                    seq_len_list[mb_id],
+                    self.model_config.num_kv_heads,
+                    self.model_config.head_dim,
+                ),
+                dtype=torch.float16,
+                pin_memory=True,
+            )
+            for mb_id in range(num_micro_batches)
+        ]
+        inter_v_cpu_list = [
+            torch.empty(
+                (
+                    seq_len_list[mb_id],
+                    self.model_config.num_kv_heads,
+                    self.model_config.head_dim,
+                ),
+                dtype=torch.float16,
+                pin_memory=True,
+            )
+            for mb_id in range(num_micro_batches)
+        ]
+
+        inter_o_gpu_list = [
+            torch.empty(
+                (
+                    seq_len_list[mb_id],
+                    self.model_config.hidden_size,
+                ),
+                dtype=torch.float16,
+                device="cuda",
+            )
+            for mb_id in range(num_micro_batches)
+        ]
+        inter_o_cpu_list = [
+            torch.empty(
+                (
+                    seq_len_list[mb_id],
+                    self.model_config.hidden_size,
+                ),
+                dtype=torch.float16,
+                pin_memory=True,
+            )
+            for mb_id in range(num_micro_batches)
+        ]
+        # Prepare the tensors on CPU
+        block_table_list = [
+            self.pinned_block_managers[layer_id].block_table.cpu()
+            for layer_id in range(len(self.transformer_layers))
+        ]
+        seq_ids_list = [
+            args_list[mb_id].seq_ids.cpu()
+            for mb_id in range(num_micro_batches)
+        ]
+        seq_lens_list = [
+            args_list[mb_id].seq_lens.cpu()
+            for mb_id in range(num_micro_batches)
+        ]
+        # Allocate buffers for weight on GPU
+        buffer_size = max(
+            [
+                self.transformer_layers[layer_id].weight_num_params
+                for layer_id in range(len(self.transformer_layers))
+            ]
+        )
+        weight_buffer_list = [
+            torch.empty(
+                (buffer_size,),
+                dtype=torch.float16,
+                device="cuda",
+            )
+            for _ in range(2)
+        ]
+        # Initialize output_tokens_list with None for each micro batch
+        output_tokens_list = [None for _ in range(num_micro_batches)]
+
+        # Prepare cuda events
+        def cuda_event_1d_list():
+            """Helper function to create a 1D list of cuda events."""
+            return [
+                torch.cuda.Event() for _ in range(len(self.transformer_layers))
+            ]
+
+        def cuda_event_2d_list():
+            """Helper function to create a 2D list of cuda events."""
+            return [
+                [torch.cuda.Event() for _ in range(num_micro_batches)]
+                for _ in range(len(self.transformer_layers))
+            ]
+
+        load_weight_events = cuda_event_1d_list()
+        pre_attn_gpu_events = cuda_event_2d_list()
+        pre_attn_dtoh_events = cuda_event_2d_list()
+        attn_cpu_events = cuda_event_2d_list()
+        attn_htod_events = cuda_event_2d_list()
+        post_attn_gpu_events = cuda_event_2d_list()
+
+        def is_layer_id_in_range(layer_id: int):
+            """Check if the layer_id is within the valid range"""
+
+            return 0 <= layer_id < len(self.transformer_layers)
+
+        def cgopipe_decorator(func):
+            """
+            A decorator that advances layer/mb IDs and validates the layer ID.
+            """
+
+            @functools.wraps(func)
+            def wrapper(layer_id: int, mb_id: int, *args, **kwargs):
+                # 1. Execute the common pre-processing steps
+                if mb_id >= num_micro_batches:
+                    mb_id = mb_id - num_micro_batches
+                    layer_id += 1
+
+                # 2. Perform the check
+                if not is_layer_id_in_range(layer_id):
+                    return None
+
+                # 3. If checks pass, run the original function with the updated values
+                return func(layer_id, mb_id, *args, **kwargs)
+
+            return wrapper
+
+        def cgopipe_load_weight_chunked_init(layer_id: int):
+            """Initialize chunked weight loading"""
+
+            if not is_layer_id_in_range(layer_id):
+                return
+
+            self.transformer_layers[layer_id].weight_to_gpu_chunked_init(
+                num_micro_batches,
+                buffer=weight_buffer_list[layer_id % len(weight_buffer_list)],
+            )
+
+        @cgopipe_decorator
+        def cgopipe_load_weight_chunked(layer_id: int, mb_id: int):
+            """Load the weight of the next layer in chunks"""
+
+            prev_mb_id = mb_id - 1
+            prev_layer_id = layer_id - 1
+            if prev_mb_id < 0:
+                prev_mb_id = num_micro_batches - 1
+                prev_layer_id -= 1
+            if prev_layer_id >= 0:
+                self.htod_stream.wait_event(
+                    post_attn_gpu_events[prev_layer_id][prev_mb_id]
+                )
+
+            with torch.cuda.stream(self.htod_stream):
+                self.transformer_layers[layer_id].weight_to_gpu_chunked(mb_id)
+                # Record the event for the current layer and micro batch
+                load_weight_events[layer_id].record()
+
+        def cgopipe_free_weight(layer_id: int):
+            """Free the weight of the current layer"""
+
+            self.transformer_layers[layer_id].weight_gpu_free()
+
+        @cgopipe_decorator
+        def bt_kvc(layer_id: int, mb_id: int):
+            """Helper function to get block table and kv cache"""
+
+            block_table = (
+                block_table_list[layer_id]
+                if not args_list[mb_id].ignore_kvcache
+                else None
+            )
+            if self.k_cache_pinned is None:
+                k_cache = None
+                v_cache = None
+            else:
+                l, r = (
+                    layer_id * self.num_pinned_blocks_per_layer,
+                    (layer_id + 1) * self.num_pinned_blocks_per_layer,
+                )
+                k_cache = self.k_cache_pinned[l:r]
+                v_cache = self.v_cache_pinned[l:r]
+            return block_table, k_cache, v_cache
+
+        @cgopipe_decorator
+        def cgopipe_pre_attn(layer_id: int, mb_id: int):
+            """Compute the pre-attention of the current micro batch"""
+
+            # Ensure the weight of the current layer is loaded
+            self.gpu_stream.wait_event(load_weight_events[layer_id])
+
+            # Ensure the previous layer's post-attention is done
+            if layer_id > 0:
+                self.gpu_stream.wait_event(
+                    post_attn_gpu_events[layer_id - 1][mb_id]
+                )
+
+            # Launch the pre-attention computation
+            with torch.cuda.stream(self.gpu_stream):
+                (
+                    inter_q_gpu_list[mb_id],
+                    inter_k_gpu_list[mb_id],
+                    inter_v_gpu_list[mb_id],
+                ) = self.transformer_layers[layer_id].decode_pre_attn(
+                    input_embds_list[mb_id],
+                    residual_buf_list[mb_id],
+                    args_list[mb_id].position_cos,
+                    args_list[mb_id].position_sin,
+                )
+                input_embds_list[mb_id] = None
+                pre_attn_gpu_events[layer_id][mb_id].record()
+
+            # Wait for the gpu event
+            self.dtoh_stream.wait_event(pre_attn_gpu_events[layer_id][mb_id])
+
+            with torch.cuda.stream(self.dtoh_stream):
+                # Offload q to cpu
+                inter_q_cpu_list[mb_id].copy_(
+                    inter_q_gpu_list[mb_id],
+                    non_blocking=True,
+                )
+                inter_q_gpu_list[mb_id] = None
+                # Offload k and v to cpu
+                inter_k_cpu_list[mb_id].copy_(
+                    inter_k_gpu_list[mb_id],
+                    non_blocking=True,
+                )
+                inter_v_cpu_list[mb_id].copy_(
+                    inter_v_gpu_list[mb_id],
+                    non_blocking=True,
+                )
+                inter_k_gpu_list[mb_id] = None
+                inter_v_gpu_list[mb_id] = None
+                pre_attn_dtoh_events[layer_id][mb_id].record()
+
+        @cgopipe_decorator
+        def cgopipe_attn(layer_id: int, mb_id: int):
+            """Compute the attention of the current micro batch"""
+
+            # Get the block table and kv cache address
+            block_table, k_cache, v_cache = bt_kvc(layer_id, mb_id)
+
+            # Wait for the dtoh event
+            self.cpu_stream.wait_event(pre_attn_dtoh_events[layer_id][mb_id])
+
+            with torch.cuda.stream(self.cpu_stream):
+                # Store cache to cpu
+                self.transformer_layers[layer_id].decode_store_kvcache(
+                    inter_k_cpu_list[mb_id],
+                    inter_v_cpu_list[mb_id],
+                    k_cache,
+                    v_cache,
+                    block_table,
+                    seq_ids_list[mb_id],
+                    seq_lens_list[mb_id],
+                )
+                # Then compute the cpu attention
+                self.transformer_layers[layer_id].decode_attn(
+                    inter_q_cpu_list[mb_id],
+                    k_cache,
+                    v_cache,
+                    block_table,
+                    args_list[mb_id].seq_block_size,
+                    args_list[mb_id].num_seq_blocks,
+                    args_list[mb_id].softmax_scale,
+                    seq_ids_list[mb_id],
+                    seq_lens_list[mb_id],
+                    inter_o_cpu_list[mb_id],
+                )
+                attn_cpu_events[layer_id][mb_id].record()
+
+            # Wait for the cpu attention to finish
+            self.htod_stream.wait_event(attn_cpu_events[layer_id][mb_id])
+
+            with torch.cuda.stream(self.htod_stream):
+                # Copy the attention output from cpu to gpu
+                inter_o_gpu_list[mb_id].copy_(
+                    inter_o_cpu_list[mb_id],
+                    non_blocking=True,
+                )
+                # Record the event for the current layer and micro batch
+                attn_htod_events[layer_id][mb_id].record()
+
+        @cgopipe_decorator
+        def cgopipe_post_attn(layer_id: int, mb_id: int):
+            """Compute the post-attention of the current micro batch"""
+
+            # Ensure the attention output is ready
+            self.gpu_stream.wait_event(attn_htod_events[layer_id][mb_id])
+
+            # Launch the post-attention computation
+            with torch.cuda.stream(self.gpu_stream):
+                input_embds_list[mb_id] = self.transformer_layers[
+                    layer_id
+                ].decode_post_attn(
+                    inter_o_gpu_list[mb_id],
+                    residual_buf_list[mb_id],
+                )
+                # Record the event for the current layer and micro batch
+                post_attn_gpu_events[layer_id][mb_id].record()
+
+        # pre layer computation
+        for mb_id in range(num_micro_batches):
+            input_embds_list[mb_id] = self.pre_layer.forward(
+                args_list[mb_id].input_ids
+            )
+            residual_buf_list[mb_id] = torch.zeros_like(
+                input_embds_list[mb_id]
+            )
+
+        # transformer layers computation
+        # load the weight of the first layer
+        self.transformer_layers[0].weight_to_gpu(buffer=weight_buffer_list[0])
+        # synchronize
+        torch.cuda.synchronize()
+
+        # prologue
+        for mb_id in range(2):
+            cgopipe_pre_attn(0, mb_id)
+            cgopipe_attn(0, mb_id)
+
+        for layer_id in range(len(self.transformer_layers)):
+            cgopipe_load_weight_chunked_init(layer_id + 1)
+
+            for mb_id in range(num_micro_batches):
+                # load the weight chunk of the next layer
+                cgopipe_load_weight_chunked(layer_id + 1, mb_id)
+
+                # post attention
+                cgopipe_post_attn(layer_id, mb_id)
+
+                # pre attention of next two micro batches
+                cgopipe_pre_attn(layer_id, mb_id + 2)
+                cgopipe_attn(layer_id, mb_id + 2)
+
+            cgopipe_free_weight(layer_id)
+
+        # Ensure all operations are complete before post-layer
+        torch.cuda.synchronize()
+
+        # post layer computation
+        for mb_id in range(num_micro_batches):
+            input_embds_list[mb_id] += residual_buf_list[mb_id]
+            output_tokens_list[mb_id] = self.post_layer.decode(
+                input_embds_list[mb_id],
+                args_list[mb_id].batch_size,
+            )
+        return output_tokens_list
+
+    @torch.inference_mode()
     def _pre_decode(
         self,
         input_ids_list: list[list[int]],  # [batch_size, *]
@@ -970,7 +1353,7 @@ class LlamaModel:
                 output_tokens = self._decode(args).tolist()
             elif scheduling_strategy == "offload-weight":
                 output_tokens = self._decode_weight_offload(args).tolist()
-        elif scheduling_strategy in ["zigzag"]:
+        elif scheduling_strategy in ["zigzag", "cgopipe"]:
             # Runs in micro batches
             batch_size = len(input_ids_list)
             micro_batch_ranges = [
@@ -991,7 +1374,10 @@ class LlamaModel:
                 )
                 for micro_batch_start, micro_batch_end in micro_batch_ranges
             ]
-            output_tokens_list = self._decode_zigzag(args_list)
+            if scheduling_strategy == "zigzag":
+                output_tokens_list = self._decode_zigzag(args_list)
+            elif scheduling_strategy == "cgopipe":
+                output_tokens_list = self._decode_cgopipe(args_list)
             output_tokens = list(
                 itertools.chain.from_iterable(
                     [

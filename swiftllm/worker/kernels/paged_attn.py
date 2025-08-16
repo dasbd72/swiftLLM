@@ -1,3 +1,4 @@
+import swiftllm_c
 import torch
 import triton
 import triton.language as tl
@@ -238,69 +239,81 @@ def paged_attention(
     assert seq_block_size % engine_config.block_size == 0
     assert o.is_contiguous()
 
-    num_seqs = q.shape[0]
-    mid_o = torch.empty(
-        (
+    if k_cache.device.type == "cuda":
+        num_seqs = q.shape[0]
+        mid_o = torch.empty(
+            (
+                num_seqs,
+                model_config.num_q_heads,
+                num_seq_blocks,
+                model_config.head_dim,
+            ),
+            device=q.device,
+            dtype=torch.float32,
+        )
+        mid_o_logexpsum = torch.empty(
+            (
+                num_seqs,
+                model_config.num_q_heads,
+                num_seq_blocks,
+            ),
+            device=q.device,
+            dtype=torch.float32,
+        )
+
+        grid = (
             num_seqs,
             model_config.num_q_heads,
             num_seq_blocks,
+        )
+        _fwd_paged_attention_phase1[grid](
+            mid_o,
+            mid_o_logexpsum,
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            # Here we multiply softmax_scale by log2(e) and use `exp2` instead of
+            # `exp` because of two reasons:
+            # 1. Up to 12 Jun 2024, all NVIDIA GPUs does not have a `exp` instruction
+            #    in PTX. When calculating `exp`, they multiply the input by log2(e)
+            #    and use `exp2` instead.
+            # 2. Some optimizations are disabled while using `exp` in a loop, see
+            #    https://github.com/triton-lang/triton/issues/2961
+            softmax_scale * 1.442695040888963,
+            seq_lens,
+            seq_ids,
+            num_seq_blocks,
+            model_config.num_q_heads,
+            model_config.num_kv_heads,
+            model_config.num_q_heads // model_config.num_kv_heads,
+            engine_config.block_size,
             model_config.head_dim,
-        ),
-        device=q.device,
-        dtype=torch.float32,
-    )
-    mid_o_logexpsum = torch.empty(
-        (
-            num_seqs,
+            seq_block_size,
+            engine_config.max_blocks_per_seq,
+            num_warps=1,
+            num_stages=4,
+        )
+
+        grid = (num_seqs, model_config.num_q_heads)
+        _fwd_paged_attention_phase2[grid](
+            mid_o,
+            mid_o_logexpsum,
+            o,
+            seq_lens,
             model_config.num_q_heads,
+            model_config.head_dim,
             num_seq_blocks,
-        ),
-        device=q.device,
-        dtype=torch.float32,
-    )
-
-    grid = (
-        num_seqs,
-        model_config.num_q_heads,
-        num_seq_blocks,
-    )
-    _fwd_paged_attention_phase1[grid](
-        mid_o,
-        mid_o_logexpsum,
-        q,
-        k_cache,
-        v_cache,
-        block_table,
-        # Here we multiply softmax_scale by log2(e) and use `exp2` instead of
-        # `exp` because of two reasons:
-        # 1. Up to 12 Jun 2024, all NVIDIA GPUs does not have a `exp` instruction
-        #    in PTX. When calculating `exp`, they multiply the input by log2(e)
-        #    and use `exp2` instead.
-        # 2. Some optimizations are disabled while using `exp` in a loop, see
-        #    https://github.com/triton-lang/triton/issues/2961
-        softmax_scale * 1.442695040888963,
-        seq_lens,
-        seq_ids,
-        num_seq_blocks,
-        model_config.num_q_heads,
-        model_config.num_kv_heads,
-        model_config.num_q_heads // model_config.num_kv_heads,
-        engine_config.block_size,
-        model_config.head_dim,
-        seq_block_size,
-        engine_config.max_blocks_per_seq,
-        num_warps=1,
-        num_stages=4,
-    )
-
-    grid = (num_seqs, model_config.num_q_heads)
-    _fwd_paged_attention_phase2[grid](
-        mid_o,
-        mid_o_logexpsum,
-        o,
-        seq_lens,
-        model_config.num_q_heads,
-        model_config.head_dim,
-        num_seq_blocks,
-        seq_block_size,
-    )
+            seq_block_size,
+        )
+    else:
+        swiftllm_c.cpu_paged_attention(
+            q,
+            k_cache,
+            v_cache,
+            block_table,
+            softmax_scale,
+            seq_ids,
+            seq_lens,
+            o,
+        )

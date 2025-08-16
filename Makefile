@@ -8,3 +8,6 @@ lint:
 	black --line-length 79 .
 	flake8 --ignore=E203,E501,W503 --exclude venv
 	clang-format -i $(C_CXX_SOURCES)
+
+install_swiftllm_c:
+	pip install -e csrc --no-build-isolation -v

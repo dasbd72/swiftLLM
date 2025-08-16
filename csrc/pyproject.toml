@@ -1,8 +1,8 @@
 [project]
 name = "swiftllm-c"
-version = "0.0.1"
+version = "0.0.2"
 description = "Some C++/CUDA sources for SwiftLLM."
-authors = [{ name = "Shengyu Liu", email = "shengyu.liu@stu.pku.edu.cn" }]
+authors = [{ name = "Sao-Hsuan Lin", email = "saohsuan@lsalab.cs.nthu.edu.tw" }]
 readme = "README.md"
 requires-python = ">=3.9"
 classifiers = [
