@@ -91,18 +91,13 @@ class LlamaModel:
         self.num_blocks_per_layer = None
         self.num_cpu_blocks = None
         self.num_cpu_blocks_per_layer = None
-        self.num_pinned_blocks = None
-        self.num_pinned_blocks_per_layer = None
         self.k_cache = None
         self.v_cache = None
         self.k_cache_cpu = None
         self.v_cache_cpu = None
-        self.k_cache_pinned = None
-        self.v_cache_pinned = None
 
         # Block manager
         self.cpu_block_managers = []
-        self.pinned_block_managers = []
         self.gpu_block_managers = []
 
         # Forward streams
@@ -213,16 +208,12 @@ class LlamaModel:
         self.num_blocks_per_layer = (
             self.num_blocks // self.model_config.num_layers
         )
-        self.num_cpu_blocks = self.engine_config.num_cpu_blocks
-        self.num_cpu_blocks_per_layer = (
-            self.num_cpu_blocks // self.model_config.num_layers
-        )
-        self.num_pinned_blocks = (
+        self.num_cpu_blocks = (
             self.engine_config.max_seqs_in_block_table
             * self.engine_config.max_blocks_per_seq
             * self.model_config.num_layers
         )
-        self.num_pinned_blocks_per_layer = (
+        self.num_cpu_blocks_per_layer = (
             self.engine_config.max_seqs_in_block_table
             * self.engine_config.max_blocks_per_seq
         )
@@ -243,7 +234,7 @@ class LlamaModel:
             kvcache_shape, dtype=torch.float16, device="cuda"
         )
 
-        # Initialize KV swap space
+        # Initialize KV swap space on pinned memory
         kvcache_cpu_shape = (
             self.num_cpu_blocks,
             self.model_config.num_kv_heads,
@@ -252,22 +243,9 @@ class LlamaModel:
         )
         self.k_cache_cpu = torch.zeros(
             kvcache_cpu_shape, dtype=torch.float16, device="cpu"
-        )
+        ).pin_memory()
         self.v_cache_cpu = torch.zeros(
             kvcache_cpu_shape, dtype=torch.float16, device="cpu"
-        )
-
-        kvcache_pinned_shape = (
-            self.num_pinned_blocks,
-            self.model_config.num_kv_heads,
-            self.engine_config.block_size,
-            self.model_config.head_dim,
-        )
-        self.k_cache_pinned = torch.zeros(
-            kvcache_pinned_shape, dtype=torch.float16, device="cpu"
-        ).pin_memory()
-        self.v_cache_pinned = torch.zeros(
-            kvcache_pinned_shape, dtype=torch.float16, device="cpu"
         ).pin_memory()
 
         # Initialize block manager
@@ -291,16 +269,17 @@ class LlamaModel:
             )
             for layer_id in range(self.model_config.num_layers)
         ]
-        self.pinned_block_managers = [
-            BlockManager(
-                f"PINNED-{layer_id}",
-                self.num_pinned_blocks_per_layer,
-                self.engine_config.max_seqs_in_block_table,
-                self.engine_config.max_blocks_per_seq,
-                self.engine_config.block_size,
-            )
-            for layer_id in range(self.model_config.num_layers)
-        ]
+
+    def _get_layer_bt_kvc(self, layer_id: int):
+        l, r = (
+            layer_id * self.num_blocks_per_layer,
+            (layer_id + 1) * self.num_blocks_per_layer,
+        )
+        return (
+            self.gpu_block_managers[layer_id].block_table,
+            self.k_cache[l:r],
+            self.v_cache[l:r],
+        )
 
     def _init_to_get_rotary(self):
         rope_scaling_factor = self.model_config.rope_scaling
@@ -334,7 +313,6 @@ class LlamaModel:
         self,
         seq_ids: torch.Tensor,
         seq_lens: torch.Tensor,
-        host_pinned_kvcache: bool = False,
     ):
         """
         Allocate blocks for the given sequences.
@@ -343,7 +321,6 @@ class LlamaModel:
         Arg:
             seq_ids torch.Tensor: A tensor of sequence IDs, shape [num_seqs].
             seq_lens torch.Tensor: A tensor of sequence lengths, shape [num_seqs].
-            host_pinned_kvcache bool: If True, allocate kv cache on CPU, otherwise on GPU.
         """
         for layer_id in range(self.model_config.num_layers):
             # kv cache should be only on one device
@@ -353,15 +330,11 @@ class LlamaModel:
             num_cpu_allocated_blocks = self.cpu_block_managers[
                 layer_id
             ].get_num_allocated_blocks(seq_ids)
-            num_pinned_allocated_blocks = self.pinned_block_managers[
-                layer_id
-            ].get_num_allocated_blocks(seq_ids)
             is_on_gpu = (num_gpu_allocated_blocks > 0).any()
             is_on_cpu = (num_cpu_allocated_blocks > 0).any()
-            is_on_pinned = (num_pinned_allocated_blocks > 0).any()
-            if is_on_gpu + is_on_cpu + is_on_pinned > 1:
+            if is_on_gpu + is_on_cpu > 1:
                 raise RuntimeError(
-                    f"KV cache should be only on one device, but found on GPU: {is_on_gpu}, CPU: {is_on_cpu}, PINNED: {is_on_pinned}"
+                    f"KV cache should be only on one device, but found on GPU: {is_on_gpu}, CPU: {is_on_cpu}"
                 )
             if is_on_gpu:
                 self.gpu_block_managers[layer_id].allocate_blocks_for_seqs(
@@ -369,16 +342,6 @@ class LlamaModel:
                 )
             elif is_on_cpu:
                 self.cpu_block_managers[layer_id].allocate_blocks_for_seqs(
-                    seq_ids, seq_lens
-                )
-            elif is_on_pinned:
-                self.pinned_block_managers[layer_id].allocate_blocks_for_seqs(
-                    seq_ids, seq_lens
-                )
-            elif host_pinned_kvcache:
-                # If no blocks are allocated, but host_pinned_kvcache is True,
-                # allocate blocks on pinned memory
-                self.pinned_block_managers[layer_id].allocate_blocks_for_seqs(
                     seq_ids, seq_lens
                 )
             else:
@@ -398,17 +361,20 @@ class LlamaModel:
         assert self.transformer_layers is not None
         input_embds = self.pre_layer.forward(args.input_ids)
         residual_buf = torch.zeros_like(input_embds)
-        for layer in self.transformer_layers:
+        for layer_id in range(self.model_config.num_layers):
+            # Compute one layer
+            block_table, k_cache, v_cache = (
+                self._get_layer_bt_kvc(layer_id)
+                if not args.ignore_kvcache
+                else (None, None, None)
+            )
+            layer = self.transformer_layers[layer_id]
             input_embds = layer.prefill(
                 input_embds,
                 residual_buf,
-                self.k_cache,
-                self.v_cache,
-                (
-                    self.gpu_block_managers[layer.layer_id].block_table
-                    if not args.ignore_kvcache
-                    else None
-                ),
+                k_cache,
+                v_cache,
+                block_table,
                 args.softmax_scale,
                 args.seq_ids,
                 args.seq_start_locs,
@@ -451,21 +417,11 @@ class LlamaModel:
 
         def prefill_compute(layer_id: int):
             # Compute the prefill pass of the current layer
-            block_table = (
-                self.gpu_block_managers[layer_id].block_table
+            block_table, k_cache, v_cache = (
+                self._get_layer_bt_kvc(layer_id)
                 if not args.ignore_kvcache
-                else None
+                else (None, None, None)
             )
-            if self.k_cache is None:
-                k_cache = None
-                v_cache = None
-            else:
-                l, r = (
-                    layer_id * self.num_blocks_per_layer,
-                    (layer_id + 1) * self.num_blocks_per_layer,
-                )
-                k_cache = self.k_cache[l:r]
-                v_cache = self.v_cache[l:r]
             input_embds_list[0] = self.transformer_layers[layer_id].prefill(
                 input_embds_list[0],
                 residual_buf_list[0],
@@ -509,7 +465,6 @@ class LlamaModel:
         input_ids_list: list[list[int]],  # [batch_size, *]
         seq_ids_list: list[int],  # [batch_size]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
-        host_pinned_kvcache: bool = False,  # Allocate kv cache on CPU
         **kwargs,
     ):
         flattened_input_ids = list(itertools.chain(*input_ids_list))
@@ -539,9 +494,7 @@ class LlamaModel:
         position_sin = self._sin_cached[position_indices]
 
         if not ignore_kvcache:
-            self._allocate_blocks_for_seqs(
-                seq_ids, seq_lens, host_pinned_kvcache=host_pinned_kvcache
-            )
+            self._allocate_blocks_for_seqs(seq_ids, seq_lens)
 
         return _PrefillArguments(
             input_ids=input_ids,
@@ -594,17 +547,20 @@ class LlamaModel:
         assert self.transformer_layers is not None
         input_embds = self.pre_layer.forward(args.input_ids)
         residual_buf = torch.zeros_like(input_embds)
-        for layer in self.transformer_layers:
+        for layer_id in range(self.model_config.num_layers):
+            # Compute one layer
+            block_table, k_cache, v_cache = (
+                self._get_layer_bt_kvc(layer_id)
+                if not args.ignore_kvcache
+                else (None, None, None)
+            )
+            layer = self.transformer_layers[layer_id]
             input_embds = layer.decode(
                 input_embds,
                 residual_buf,
-                self.k_cache,
-                self.v_cache,
-                (
-                    self.gpu_block_managers[layer.layer_id].block_table
-                    if not args.ignore_kvcache
-                    else None
-                ),
+                k_cache,
+                v_cache,
+                block_table,
                 args.seq_block_size,
                 args.num_seq_blocks,
                 args.softmax_scale,
@@ -646,21 +602,11 @@ class LlamaModel:
 
         def decode_compute(layer_id: int):
             # Compute the decode pass of the current layer
-            block_table = (
-                self.gpu_block_managers[layer_id].block_table
+            block_table, k_cache, v_cache = (
+                self._get_layer_bt_kvc(layer_id)
                 if not args.ignore_kvcache
-                else None
+                else (None, None, None)
             )
-            if self.k_cache is None:
-                k_cache = None
-                v_cache = None
-            else:
-                l, r = (
-                    layer_id * self.num_blocks_per_layer,
-                    (layer_id + 1) * self.num_blocks_per_layer,
-                )
-                k_cache = self.k_cache[l:r]
-                v_cache = self.v_cache[l:r]
             input_embds_list[0] = self.transformer_layers[layer_id].decode(
                 input_embds_list[0],
                 residual_buf_list[0],
@@ -774,7 +720,6 @@ class LlamaModel:
                     layer_id,
                     args_list[mb_id].seq_ids.tolist(),
                     is_swap_in=True,
-                    is_pinned=True,
                 )
 
         @zigzag_decorator
@@ -787,27 +732,16 @@ class LlamaModel:
                     layer_id,
                     args_list[mb_id].seq_ids.tolist(),
                     is_swap_in=False,
-                    is_pinned=True,
                 )
 
         @zigzag_decorator
         def zigzag_compute(layer_id: int, mb_id: int):
             # Compute the current micro batch
-            block_table = (
-                self.gpu_block_managers[layer_id].block_table
+            block_table, k_cache, v_cache = (
+                self._get_layer_bt_kvc(layer_id)
                 if not args_list[mb_id].ignore_kvcache
-                else None
+                else (None, None, None)
             )
-            if self.k_cache is None:
-                k_cache = None
-                v_cache = None
-            else:
-                l, r = (
-                    layer_id * self.num_blocks_per_layer,
-                    (layer_id + 1) * self.num_blocks_per_layer,
-                )
-                k_cache = self.k_cache[l:r]
-                v_cache = self.v_cache[l:r]
             input_embds_list[mb_id] = self.transformer_layers[layer_id].decode(
                 input_embds_list[mb_id],
                 residual_buf_list[mb_id],
@@ -958,7 +892,7 @@ class LlamaModel:
         ]
         # Prepare the tensors on CPU
         block_table_list = [
-            self.pinned_block_managers[layer_id].block_table.cpu()
+            self.cpu_block_managers[layer_id].block_table.cpu()
             for layer_id in range(len(self.transformer_layers))
         ]
         seq_ids_list = [
@@ -1078,16 +1012,16 @@ class LlamaModel:
                 if not args_list[mb_id].ignore_kvcache
                 else None
             )
-            if self.k_cache_pinned is None:
+            if self.k_cache_cpu is None:
                 k_cache = None
                 v_cache = None
             else:
                 l, r = (
-                    layer_id * self.num_pinned_blocks_per_layer,
-                    (layer_id + 1) * self.num_pinned_blocks_per_layer,
+                    layer_id * self.num_cpu_blocks_per_layer,
+                    (layer_id + 1) * self.num_cpu_blocks_per_layer,
                 )
-                k_cache = self.k_cache_pinned[l:r]
-                v_cache = self.v_cache_pinned[l:r]
+                k_cache = self.k_cache_cpu[l:r]
+                v_cache = self.v_cache_cpu[l:r]
             return block_table, k_cache, v_cache
 
         @cgopipe_decorator
@@ -1262,7 +1196,6 @@ class LlamaModel:
         seq_ids_list: list[int],  # [batch_size]
         seq_len_list: list[int],  # [batch_size]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
-        host_pinned_kvcache: bool = False,  # Allocate kv cache on CPU
         **kwargs,
     ):
         flattened_input_ids = list(itertools.chain(*input_ids_list))
@@ -1279,9 +1212,7 @@ class LlamaModel:
         position_sin = self._sin_cached[position_indices]
 
         if not ignore_kvcache:
-            self._allocate_blocks_for_seqs(
-                seq_ids, seq_lens, host_pinned_kvcache=host_pinned_kvcache
-            )
+            self._allocate_blocks_for_seqs(seq_ids, seq_lens)
 
         # Select the seq_block_size
         #
@@ -1369,7 +1300,6 @@ class LlamaModel:
                     seq_ids_list[micro_batch_start:micro_batch_end],
                     seq_len_list[micro_batch_start:micro_batch_end],
                     ignore_kvcache=ignore_kvcache,
-                    host_pinned_kvcache=True,
                     **kwargs,
                 )
                 for micro_batch_start, micro_batch_end in micro_batch_ranges
@@ -1397,22 +1327,16 @@ class LlamaModel:
         layer_id: int,
         seq_ids_list: list[int],
         is_swap_in: bool,
-        is_pinned: bool = False,
     ):
-        cpu_block_manager = (
-            self.pinned_block_managers[layer_id]
-            if is_pinned
-            else self.cpu_block_managers[layer_id]
-        )
         src_block_manager = (
-            cpu_block_manager
+            self.cpu_block_managers[layer_id]
             if is_swap_in
             else self.gpu_block_managers[layer_id]
         )
         dst_block_manager = (
             self.gpu_block_managers[layer_id]
             if is_swap_in
-            else cpu_block_manager
+            else self.cpu_block_managers[layer_id]
         )
         seq_ids = torch.tensor(seq_ids_list, dtype=torch.int32, device="cuda")
         # To prevent swapping in blocks that are already allocated on the destination
@@ -1446,16 +1370,10 @@ class LlamaModel:
         end_off = (layer_id + 1) * self.num_blocks_per_layer
         k_cache_device_slice = self.k_cache[start_off:end_off]
         v_cache_device_slice = self.v_cache[start_off:end_off]
-        if not is_pinned:
-            start_off = layer_id * self.num_cpu_blocks_per_layer
-            end_off = (layer_id + 1) * self.num_cpu_blocks_per_layer
-            k_cache_host_slice = self.k_cache_cpu[start_off:end_off]
-            v_cache_host_slice = self.v_cache_cpu[start_off:end_off]
-        else:
-            start_off = layer_id * self.num_pinned_blocks_per_layer
-            end_off = (layer_id + 1) * self.num_pinned_blocks_per_layer
-            k_cache_host_slice = self.k_cache_pinned[start_off:end_off]
-            v_cache_host_slice = self.v_cache_pinned[start_off:end_off]
+        start_off = layer_id * self.num_cpu_blocks_per_layer
+        end_off = (layer_id + 1) * self.num_cpu_blocks_per_layer
+        k_cache_host_slice = self.k_cache_cpu[start_off:end_off]
+        v_cache_host_slice = self.v_cache_cpu[start_off:end_off]
         swiftllm_c.swap_blocks(
             src_block_ids.tolist(),
             dst_block_ids.tolist(),
@@ -1470,26 +1388,23 @@ class LlamaModel:
         self,
         seq_ids_list: list[int],
         is_swap_in: bool,
-        is_pinned: bool = False,
     ):
         for layer_id in range(self.model_config.num_layers):
-            self._swap_layer(
-                layer_id, seq_ids_list, is_swap_in, is_pinned=is_pinned
-            )
+            self._swap_layer(layer_id, seq_ids_list, is_swap_in)
 
     @torch.inference_mode()
-    def swap_in_seqs(self, seq_ids_list: list[int], is_pinned: bool = False):
+    def swap_in_seqs(self, seq_ids_list: list[int]):
         """
         Swap in (move blocks from CPU to GPU) the specified sequences.
         """
-        self._swap(seq_ids_list, True, is_pinned=is_pinned)
+        self._swap(seq_ids_list, True)
 
     @torch.inference_mode()
-    def swap_out_seqs(self, seq_ids_list: list[int], is_pinned: bool = False):
+    def swap_out_seqs(self, seq_ids_list: list[int]):
         """
         Swap out (move blocks from GPU to CPU) the specified sequences.
         """
-        self._swap(seq_ids_list, False, is_pinned=is_pinned)
+        self._swap(seq_ids_list, False)
 
     @torch.inference_mode()
     def free_seqs_resources(self, seq_ids_list: list[int]):
@@ -1524,18 +1439,5 @@ class LlamaModel:
             num_used_blocks += (
                 self.cpu_block_managers[layer_id].num_blocks
                 - self.cpu_block_managers[layer_id].num_free_blocks
-            )
-        return num_used_blocks
-
-    @torch.inference_mode()
-    def get_num_used_pinned_blocks(self) -> int:
-        """
-        Get the number of used CPU blocks.
-        """
-        num_used_blocks = 0
-        for layer_id in range(self.model_config.num_layers):
-            num_used_blocks += (
-                self.pinned_block_managers[layer_id].num_blocks
-                - self.pinned_block_managers[layer_id].num_free_blocks
             )
         return num_used_blocks
