@@ -1,8 +1,11 @@
 #include "cpu_paged_attention.h"
 
+#ifdef USE_CUDA
 #include <c10/cuda/CUDAStream.h>
-#include <c10/util/Optional.h>
 #include <cuda_runtime.h>
+#endif  // USE_CUDA
+
+#include <c10/util/Optional.h>
 #include <torch/torch.h>
 
 #include "c10/util/Half.h"
@@ -361,13 +364,16 @@ void cpu_paged_attention(torch::Tensor q, torch::Tensor k_cache,
   };
   _check_cpa_data(*data);
 
+#ifdef USE_CUDA
   // Current stream
   c10::cuda::CUDAStream stream = c10::cuda::getCurrentCUDAStream();
   c10::cuda::CUDAStream default_stream = c10::cuda::getDefaultCUDAStream();
   if (stream == default_stream) {
     // If we are on the default stream, run the CPU paged attention directly
+#endif  // USE_CUDA
     _cpu_paged_attention(*data);
     delete data;  // Clean up the memory after use
+#ifdef USE_CUDA
   } else {
     cudaError_t err = cudaLaunchHostFunc(
         stream.stream(),
@@ -383,4 +389,5 @@ void cpu_paged_attention(torch::Tensor q, torch::Tensor k_cache,
                                std::string(cudaGetErrorString(err)));
     }
   }
+#endif  // USE_CUDA
 }

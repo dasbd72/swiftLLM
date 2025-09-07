@@ -1,3 +1,4 @@
+#ifdef USE_CUDA
 #include "block_swapping.h"
 
 #include <ATen/cuda/CUDAContext.h>  // for at::cuda::getCurrentCUDAStream()
@@ -76,3 +77,4 @@ void swap_blocks(const std::vector<int64_t> &source_block_ids,
     next_index = end_index;
   }
 }
+#endif  // USE_CUDA

@@ -1,3 +1,4 @@
+#ifdef USE_CUDA
 #include "cpu_kvcache_mgmt.h"
 
 #include <c10/cuda/CUDAStream.h>
@@ -194,3 +195,4 @@ void cpu_store_kvcache_decode(torch::Tensor k, torch::Tensor v,
     }
   }
 }
+#endif  // USE_CUDA

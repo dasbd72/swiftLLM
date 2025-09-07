@@ -1,6 +1,7 @@
 import os
 import subprocess
 
+import torch
 from setuptools import setup
 from torch.utils import cpp_extension
 
@@ -24,6 +25,14 @@ class BuildExtensionWithISPC(cpp_extension.BuildExtension):
         super().run()
 
 
+cxx_flags = [
+    "-O3",
+    "-fopenmp",
+    "-DISPC_CPU_PAGED_ATTENTION",
+    "-D__fp16=_Float16",
+]
+if torch.cuda.is_available():
+    cxx_flags.append("-DUSE_CUDA")
 ext_modules = [
     cpp_extension.CUDAExtension(
         "swiftllm_c",
@@ -35,12 +44,7 @@ ext_modules = [
             "src/thread_pool.cpp",
         ],
         extra_compile_args={
-            "cxx": [
-                "-O3",
-                "-fopenmp",
-                "-DISPC_CPU_PAGED_ATTENTION",
-                "-D__fp16=_Float16",
-            ],
+            "cxx": cxx_flags,
             "nvcc": ["-O3", "--use_fast_math"],
         },
         extra_objects=[
