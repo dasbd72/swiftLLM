@@ -3,7 +3,6 @@ import itertools
 import math
 from dataclasses import dataclass
 
-import swiftllm_c
 import torch
 
 from swiftllm.engine_config import EngineConfig, SchedulingStrategy
@@ -15,6 +14,8 @@ from swiftllm.worker.weight import load_weights
 from .layers.post_layer import LlamaPostLayer
 from .layers.pre_layer import LlamaPreLayer
 from .layers.transformer_layer import LlamaTransformerLayer
+
+import swiftllm_c  # isort: skip
 
 
 @dataclass
