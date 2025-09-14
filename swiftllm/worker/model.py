@@ -187,11 +187,14 @@ class LlamaModel:
         peak_memory = total_memory - free_memory
         useable_memory = total_memory * self.engine_config.gpu_mem_utilization
         print(
-            f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB, runtime peak memory: {peak_memory/GB:.2f} GB"
+            f"[Model.profile] GPU total memory: {total_memory/GB:.2f} GB,"
+            f" runtime peak memory: {peak_memory/GB:.2f} GB"
         )
         if useable_memory < peak_memory:
             raise RuntimeError(
-                f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB * {self.engine_config.gpu_mem_utilization})"
+                f"Peak memory {peak_memory/GB:.2f} GB exceeds usable memory"
+                f" {useable_memory/GB:.2f} GB ({total_memory/GB:.2f} GB *"
+                f" {self.engine_config.gpu_mem_utilization})"
             )
         block_size_bytes = (
             self.engine_config.block_size * self.model_config.get_kvslot_size()
@@ -335,7 +338,8 @@ class LlamaModel:
             is_on_cpu = (num_cpu_allocated_blocks > 0).any()
             if is_on_gpu + is_on_cpu > 1:
                 raise RuntimeError(
-                    f"KV cache should be only on one device, but found on GPU: {is_on_gpu}, CPU: {is_on_cpu}"
+                    "KV cache should be only on one device, but found on GPU:"
+                    f" {is_on_gpu}, CPU: {is_on_cpu}"
                 )
             if is_on_gpu:
                 self.gpu_block_managers[layer_id].allocate_blocks_for_seqs(
@@ -1351,7 +1355,8 @@ class LlamaModel:
         is_on_dst = (num_dst_allocated_blocks > 0).any()
         if is_on_src + is_on_dst > 1:
             raise RuntimeError(
-                f"Blocks should be only on one device, but found on both src: {is_on_src} and dst: {is_on_dst}"
+                "Blocks should be only on one device, but found on both src:"
+                f" {is_on_src} and dst: {is_on_dst}"
             )
         if not is_on_src or is_on_dst:
             # No blocks to swap in or out

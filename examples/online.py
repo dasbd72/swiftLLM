@@ -51,7 +51,10 @@ async def main():
     """
     parser.add_argument(
         "--model-path",
-        help="Path to the model. Note: please download the model weights from HuggingFace in advance and specify the path here.",
+        help=(
+            "Path to the model. Note: please download the model weights from"
+            " HuggingFace in advance and specify the path here."
+        ),
         type=str,
         required=True,
     )

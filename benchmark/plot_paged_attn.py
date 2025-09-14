@@ -1,5 +1,5 @@
-import pandas as pd
 import matplotlib.pyplot as plt
+import pandas as pd
 
 
 def plot_profiling_results(csv_filename: str, output_filename: str):

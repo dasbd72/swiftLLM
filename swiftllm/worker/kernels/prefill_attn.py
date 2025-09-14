@@ -171,7 +171,8 @@ def prefill_attention(
         BLOCK_K = 64
     else:
         print(
-            f"Warning: Unsupported GPU {torch.cuda.get_device_name(0)}. Using default block size."
+            f"Warning: Unsupported GPU {torch.cuda.get_device_name(0)}. Using"
+            " default block size."
         )
         BLOCK_Q = 64
         BLOCK_K = 64

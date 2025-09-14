@@ -55,7 +55,9 @@ class BlockManager:
         """
         if num_blocks > self.num_free_blocks:
             raise RuntimeError(
-                f"No enough free blocks available on {self.device_name} ({self.num_blocks} in total, {self.num_free_blocks} free, {num_blocks} requested)"
+                "No enough free blocks available on"
+                f" {self.device_name} ({self.num_blocks} in total,"
+                f" {self.num_free_blocks} free, {num_blocks} requested)"
             )
         selected_blocks = torch.nonzero(self.is_block_free)[:num_blocks].view(
             -1

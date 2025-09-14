@@ -254,9 +254,10 @@ def load_weights(
                 safetensor_filename = None
             else:
                 # The weight is stored in a single file
-                assert (
-                    len(safetensor_files) == 1
-                ), "model.safetensors.index.json not found, but there are multiple .safetensors files"
+                assert len(safetensor_files) == 1, (
+                    "model.safetensors.index.json not found, but there are"
+                    " multiple .safetensors files"
+                )
                 safetensor_index = None
                 safetensor_filename = safetensor_files[0]
 

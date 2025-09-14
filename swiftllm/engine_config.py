@@ -27,8 +27,10 @@ class EngineConfig:
     max_tokens_in_batch: int
 
     # Offloading related parameters
-    weight_device: str = (
-        "cuda"  # The device to load the model on. This is only used for the initial loading of the model.
+    weight_device: (
+        str
+    ) = (  # The device to load the model on. This is only used for the initial loading of the model.
+        "cuda"
     )
     profile_scheduling_strategy: SchedulingStrategy = "gpu"
     max_micro_batch_size: int | None = None
@@ -42,7 +44,11 @@ class EngineConfig:
             "--model-path",
             type=str,
             required=True,
-            help="Path to the model directory (currently SwiftLLM does not support downloading from HuggingFace, so please download in advance)",
+            help=(
+                "Path to the model directory (currently SwiftLLM does not"
+                " support downloading from HuggingFace, so please download in"
+                " advance)"
+            ),
         )
         parser.add_argument(
             "--use-dummy",
@@ -97,5 +103,8 @@ class EngineConfig:
         parser.add_argument(
             "--weight-device",
             type=str,
-            help="Device that the model weight is loaded on (e.g., 'cpu', 'cuda')",
+            help=(
+                "Device that the model weight is loaded on (e.g., 'cpu',"
+                " 'cuda')"
+            ),
         )

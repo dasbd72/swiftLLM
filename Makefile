@@ -5,7 +5,7 @@ help:
 
 lint:
 	isort --line-length 79 --profile black .
-	black --line-length 79 .
+	black --line-length 79 --preview --enable-unstable-feature string_processing .
 	flake8 --ignore=E203,E501,W503 --exclude venv
 	clang-format -i $(C_CXX_SOURCES)
 
