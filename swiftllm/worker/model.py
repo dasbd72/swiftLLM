@@ -130,7 +130,10 @@ class LlamaModel:
 
         # Initialize layers
         self.pre_layer = LlamaPreLayer(
-            self.model_config, self.weight, self.engine_config.weight_device
+            self.model_config,
+            self.weight,
+            self.engine_config.weight_device,
+            self.engine_config.pin_weight_cpu,
         )
         self.pre_layer.weight_to_gpu()
         self.transformer_layers: list[LlamaTransformerLayer] = []
@@ -141,10 +144,14 @@ class LlamaModel:
                 self.weight.layers[layer_id],
                 self.engine_config.weight_device,
                 layer_id,
+                self.engine_config.pin_weight_cpu,
             )
             self.transformer_layers.append(layer)
         self.post_layer = LlamaPostLayer(
-            self.model_config, self.weight, self.engine_config.weight_device
+            self.model_config,
+            self.weight,
+            self.engine_config.weight_device,
+            self.engine_config.pin_weight_cpu,
         )
         self.post_layer.weight_to_gpu()
 
@@ -247,10 +254,13 @@ class LlamaModel:
         )
         self.k_cache_cpu = torch.zeros(
             kvcache_cpu_shape, dtype=torch.float16, device="cpu"
-        ).pin_memory()
+        )
         self.v_cache_cpu = torch.zeros(
             kvcache_cpu_shape, dtype=torch.float16, device="cpu"
-        ).pin_memory()
+        )
+        if self.engine_config.pin_kv_cpu:
+            self.k_cache_cpu = self.k_cache_cpu.pin_memory()
+            self.v_cache_cpu = self.v_cache_cpu.pin_memory()
 
         # Initialize block manager
         self.gpu_block_managers = [

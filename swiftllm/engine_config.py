@@ -27,6 +27,8 @@ class EngineConfig:
     max_tokens_in_batch: int
 
     # Offloading related parameters
+    pin_weight_cpu: bool = False
+    pin_kv_cpu: bool = False
     weight_device: (
         str
     ) = (  # The device to load the model on. This is only used for the initial loading of the model.

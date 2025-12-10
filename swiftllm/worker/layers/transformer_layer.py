@@ -24,6 +24,7 @@ class LlamaTransformerLayer:
         weight: LlamaTransformerLayerWeight,
         weight_device: str,
         layer_id: int,
+        pin_weight_cpu: bool,
     ):
         self.model_config = model_config
         self.engine_config = engine_config
@@ -48,7 +49,11 @@ class LlamaTransformerLayer:
         self.weight_cpu = {name: None for name in self.weight_names}
         if weight_device == "cpu":
             for name in self.weight_names:
-                self.weight_cpu[name] = getattr(weight, name).pin_memory()
+                self.weight_cpu[name] = (
+                    getattr(weight, name).pin_memory()
+                    if pin_weight_cpu
+                    else getattr(weight, name).to("cpu")
+                )
                 setattr(weight, name, None)
         self.layer_id = layer_id
 

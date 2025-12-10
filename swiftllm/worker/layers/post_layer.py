@@ -12,6 +12,7 @@ class LlamaPostLayer:
         model_config: LlamaModelConfig,
         weights: LlamaWeight,
         weight_device: str,
+        pin_weight_cpu: bool,
     ):
         self.model_config = model_config
         self.weights = weights
@@ -23,7 +24,11 @@ class LlamaPostLayer:
         self.weights_cpu = {name: None for name in self.weight_names}
         if weight_device == "cpu":
             for name in self.weight_names:
-                self.weights_cpu[name] = getattr(weights, name).pin_memory()
+                self.weights_cpu[name] = (
+                    getattr(weights, name).pin_memory()
+                    if pin_weight_cpu
+                    else getattr(weights, name).to("cpu")
+                )
                 setattr(weights, name, None)
 
     def weight_to_gpu(self):
