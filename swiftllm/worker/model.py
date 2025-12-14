@@ -202,7 +202,7 @@ class LlamaModel:
             scaling_factor = rope_scaling.get("factor", 4.0)
             low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
             high_freq_factor = rope_scaling.get("high_freq_factor", 1.0)
-            rope_type = rope_scaling.get("rope_type", "llama3")
+            # rope_type = rope_scaling.get("rope_type", "llama3")
             original_max_position_embeddings = rope_scaling.get(
                 "original_max_position_embeddings", max_position_embeddings
             )
