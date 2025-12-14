@@ -10,16 +10,14 @@ from swiftllm.worker.infer_state import LlamaInferState
 
 @triton.jit
 def _fwd_kvcache_mgmt_prefill_kernel(
-    k_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
-    v_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
+    k_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
+    v_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
     k: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, head_dim], contiguous
     v: torch.Tensor,  # [num_prefill_tokens, num_kv_heads, head_dim], contiguous
     block_table: torch.Tensor,  # [*, max_blocks_per_seq], contiguous
     seq_ids: torch.Tensor,  # [num_prefill_seqs], contiguous
     prefill_seq_start_locs: torch.Tensor,  # [num_prefill_seqs], contiguous
     prefill_seq_lens: torch.Tensor,  # [num_prefill_seqs], contiguous
-    cur_layer: int,
-    num_layers: tl.constexpr,
     num_kv_heads: tl.constexpr,
     block_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -49,10 +47,7 @@ def _fwd_kvcache_mgmt_prefill_kernel(
         + tl.arange(0, head_dim)[None, None, :]
     )
     offs_kvcache = (
-        (my_block_index * num_layers + cur_layer)
-        * num_kv_heads
-        * block_size
-        * head_dim
+        my_block_index * num_kv_heads * block_size * head_dim
         + (tl.arange(0, num_kv_heads) * block_size * head_dim)[None, :, None]
         + (tl.arange(0, block_size) * head_dim)[:, None, None]
         + tl.arange(0, head_dim)[None, None, :]
@@ -65,15 +60,13 @@ def _fwd_kvcache_mgmt_prefill_kernel(
 
 @triton.jit
 def _fwd_kvcache_mgmt_decoding_kernel(
-    k_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
-    v_cache: torch.Tensor,  # [num_blocks, num_layers, num_kv_heads, block_size, head_dim], contiguous
+    k_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
+    v_cache: torch.Tensor,  # [num_blocks, num_kv_heads, block_size, head_dim], contiguous
     k: torch.Tensor,  # [num_decoding_seqs, num_kv_heads, head_dim], contiguous
     v: torch.Tensor,  # [num_decoding_seqs, num_kv_heads, head_dim], contiguous
     block_table: torch.Tensor,  # [*, max_blocks_per_seq], contiguous
     decoding_seq_ids: torch.Tensor,  # [num_decoding_seqs], contiguous
     decoding_seq_lens: torch.Tensor,  # [num_decoding_seqs], contiguous
-    cur_layer: int,
-    num_layers: tl.constexpr,
     num_kv_heads: tl.constexpr,
     block_size: tl.constexpr,
     head_dim: tl.constexpr,
@@ -95,10 +88,7 @@ def _fwd_kvcache_mgmt_decoding_kernel(
         + tl.arange(0, head_dim)[None, :]
     )
     offs_kvcache = (
-        (my_block_index * num_layers + cur_layer)
-        * num_kv_heads
-        * block_size
-        * head_dim
+        my_block_index * num_kv_heads * block_size * head_dim
         + (tl.arange(0, num_kv_heads) * block_size * head_dim)[:, None]
         + my_block_offset * head_dim
         + tl.arange(0, head_dim)[None, :]
@@ -117,7 +107,6 @@ def store_kvcache(
     model_config: LlamaModelConfig,
     engine_config: EngineConfig,
     infer_state: LlamaInferState,
-    cur_layer: int,
 ):
     assert k.is_contiguous()
     assert v.is_contiguous()
@@ -141,8 +130,6 @@ def store_kvcache(
             infer_state.seq_ids,
             infer_state.prefill_seq_start_locs,
             infer_state.prefill_seq_lens,
-            cur_layer,
-            model_config.num_layers,
             model_config.num_kv_heads,
             engine_config.block_size,
             model_config.head_dim,
@@ -159,8 +146,6 @@ def store_kvcache(
             block_table,
             infer_state.seq_ids[infer_state.num_prefill_seqs :],
             infer_state.decoding_seq_lens,
-            cur_layer,
-            model_config.num_layers,
             model_config.num_kv_heads,
             engine_config.block_size,
             model_config.head_dim,

@@ -85,7 +85,6 @@ class LlamaTransformerLayer:
                 self.model_config,
                 self.engine_config,
                 infer_state,
-                self.layer_id,
             )
         store_kvcache_event = torch.cuda.Event()
         store_kvcache_event.record()
@@ -132,7 +131,6 @@ class LlamaTransformerLayer:
                     self.model_config,
                     self.engine_config,
                     infer_state,
-                    self.layer_id,
                     o[infer_state.num_prefill_tokens :, :],
                 )
                 event = torch.cuda.Event()

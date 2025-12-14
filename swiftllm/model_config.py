@@ -40,9 +40,7 @@ class LlamaModelConfig:
         """
         Get the size of one kv slot (the kv cache of one token) (in bytes)
         """
-        return (
-            2 * self.num_layers * self.num_kv_heads * self.head_dim
-        ) * dtype.itemsize
+        return (2 * self.num_kv_heads * self.head_dim) * dtype.itemsize
 
     @staticmethod
     def load_from_model_path(model_path: str) -> "LlamaModelConfig":
