@@ -307,7 +307,10 @@ def load_weights(
                 file_path = os.path.join(model_path, file_name)
                 if file_path not in opened_files:
                     opened_files[file_path] = torch.load(
-                        file_path, map_location="cuda", mmap=True
+                        file_path,
+                        map_location="cuda",
+                        mmap=True,
+                        weights_only=False,
                     )
                 file = opened_files[file_path]
                 return file[item.key].to(item.dtype)
