@@ -68,13 +68,18 @@ class LlamaTransformerLayerWeight(WeightBase):
     """
 
     def __init__(
-        self, layer_id: int, model_config: LlamaModelConfig, dtype: torch.dtype
+        self,
+        layer_id: int,
+        model_config: LlamaModelConfig,
+        dtype: torch.dtype,
+        model_version: str = "llama",
     ):
         super().__init__()
 
         self.layer_id = layer_id
         self.model_config = model_config
         self.dtype = dtype
+        self.model_version = model_version
 
         self.register_weight(
             RegisteredWeightItem(
@@ -177,11 +182,17 @@ class LlamaTransformerLayerWeight(WeightBase):
 
 class LlamaWeight(WeightBase):
 
-    def __init__(self, model_config: LlamaModelConfig, dtype: torch.dtype):
+    def __init__(
+        self,
+        model_config: LlamaModelConfig,
+        dtype: torch.dtype,
+        model_version: str = "llama",
+    ):
         super().__init__()
 
         self.model_config = model_config
         self.dtype = dtype
+        self.model_version = model_version
 
         self.register_weight(
             RegisteredWeightItem(
@@ -191,14 +202,32 @@ class LlamaWeight(WeightBase):
                 self.dtype,
             )
         )
-        self.register_weight(
-            RegisteredWeightItem(
-                "lm_head",
-                "lm_head.weight",
-                (self.model_config.vocab_size, self.model_config.hidden_size),
-                self.dtype,
+
+        if model_version == "llama3.2":
+            self.register_weight(
+                RegisteredWeightItem(
+                    "lm_head",
+                    "model.embed_tokens.weight",
+                    (
+                        self.model_config.vocab_size,
+                        self.model_config.hidden_size,
+                    ),
+                    self.dtype,
+                )
             )
-        )
+        else:
+            self.register_weight(
+                RegisteredWeightItem(
+                    "lm_head",
+                    "lm_head.weight",
+                    (
+                        self.model_config.vocab_size,
+                        self.model_config.hidden_size,
+                    ),
+                    self.dtype,
+                )
+            )
+
         self.register_weight(
             RegisteredWeightItem(
                 "final_norm",
@@ -211,7 +240,7 @@ class LlamaWeight(WeightBase):
         self.layers: list[LlamaTransformerLayerWeight] = []
         for i in range(self.model_config.num_layers):
             layer = LlamaTransformerLayerWeight(
-                i, self.model_config, self.dtype
+                i, self.model_config, self.dtype, self.model_version
             )
             self.layers.append(layer)
 
@@ -225,10 +254,29 @@ def load_weights(
     dtype: torch.dtype,
     model_path: str,
     use_dummy: bool = False,
+    model_version: str = "auto",
 ) -> LlamaWeight:
     """
     Load weights from a given path
     """
+    if model_version == "auto":
+        config_path = os.path.join(model_path, "config.json")
+        if os.path.exists(config_path):
+            with open(config_path, "r", encoding="utf-8") as f:
+                config_data = json.load(f)
+
+            # In Llama 3.2, rope_scaling is a dictionary
+            # TODO 1: Add more robust detection logic
+            # TODO 2: Add more model versions
+            if "rope_scaling" in config_data and isinstance(
+                config_data["rope_scaling"], dict
+            ):
+                model_version = "llama3.2"
+            else:
+                model_version = "llama"
+        else:
+            model_version = "llama"
+
     if use_dummy:
 
         def weight_getter_dummy(item: RegisteredWeightItem):
@@ -317,6 +365,6 @@ def load_weights(
 
             getter = weight_getter_real
 
-    weight = LlamaWeight(model_config, dtype)
+    weight = LlamaWeight(model_config, dtype, model_version)
     weight.load_weights(getter)
     return weight

@@ -15,3 +15,10 @@ class TokenizationEngine:
             "input_ids"
         ]
         return prompt_token_ids
+
+    def decode(
+        self, token_ids: list[int], skip_special_tokens: bool = True
+    ) -> str:
+        return self.tokenizer.decode(
+            token_ids, skip_special_tokens=skip_special_tokens
+        )
