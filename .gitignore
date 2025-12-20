@@ -168,6 +168,7 @@ cython_debug/
 #.idea/
 
 # C source
+csrc/src/cpu_paged_attention_ispc.h
 *.o
 
 # Clangd

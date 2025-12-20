@@ -367,21 +367,38 @@ class LlamaModel:
         input_embds = self.pre_layer.forward(input_ids)
         residual_buf = torch.zeros_like(input_embds)
         for layer in self.transformer_layers:
-            block_table = (
-                self.gpu_block_managers[layer.layer_id].block_table
-                if not infer_state.ignore_kvcache
-                else None
-            )
-            if self.k_cache is None:
-                k_cache = None
-                v_cache = None
-            else:
-                l, r = (
-                    layer.layer_id * self.num_blocks_per_layer,
-                    (layer.layer_id + 1) * self.num_blocks_per_layer,
+            if infer_state.cpu_attention:
+                block_table = (
+                    self.cpu_block_managers[layer.layer_id].block_table.cpu()
+                    if not infer_state.ignore_kvcache
+                    else None
                 )
-                k_cache = self.k_cache[l:r]
-                v_cache = self.v_cache[l:r]
+                if self.k_cache is None:
+                    k_cache = None
+                    v_cache = None
+                else:
+                    l, r = (
+                        layer.layer_id * self.num_cpu_blocks_per_layer,
+                        (layer.layer_id + 1) * self.num_cpu_blocks_per_layer,
+                    )
+                    k_cache = self.k_cache_cpu[l:r]
+                    v_cache = self.v_cache_cpu[l:r]
+            else:
+                block_table = (
+                    self.gpu_block_managers[layer.layer_id].block_table
+                    if not infer_state.ignore_kvcache
+                    else None
+                )
+                if self.k_cache is None:
+                    k_cache = None
+                    v_cache = None
+                else:
+                    l, r = (
+                        layer.layer_id * self.num_blocks_per_layer,
+                        (layer.layer_id + 1) * self.num_blocks_per_layer,
+                    )
+                    k_cache = self.k_cache[l:r]
+                    v_cache = self.v_cache[l:r]
 
             input_embds = layer.forward(
                 input_embds,
@@ -402,6 +419,7 @@ class LlamaModel:
         seq_ids_list: list[int],  # [batch_size]
         decoding_seq_lens_list: list[int],  # [num_decoding_seqs]
         ignore_kvcache: bool = False,  # Skip actions related to kv cache, useful when profiling the number of kv blocks
+        cpu_attention: bool = False,  # Use CPU attention implementation
     ) -> list[int]:
         """
         Run a forward pass of the LlamaModel.
@@ -438,8 +456,12 @@ class LlamaModel:
             max(prefill_seq_lens_list) if prefill_seq_lens_list else 0
         )
 
+        device = "cpu" if cpu_attention else "cuda"
+        decoding_seq_ids = torch.tensor(
+            seq_ids_list[num_prefill_seqs:], dtype=torch.int32, device=device
+        )
         decoding_seq_lens = torch.tensor(
-            decoding_seq_lens_list, dtype=torch.int32, device="cuda"
+            decoding_seq_lens_list, dtype=torch.int32, device=device
         )
         max_decoding_len = (
             max(decoding_seq_lens_list) if decoding_seq_lens_list else 0
@@ -460,7 +482,7 @@ class LlamaModel:
                     if prefill_seq_lens_list
                     else torch.empty(0, device="cuda", dtype=torch.int32)
                 ),
-                decoding_seq_lens - 1,
+                decoding_seq_lens.cuda() - 1,
             ),
             dim=0,
         )
@@ -509,6 +531,7 @@ class LlamaModel:
             prefill_seq_lens=prefill_seq_lens,
             max_prefill_len=max_prefill_len,
             num_decoding_seqs=batch_size - num_prefill_seqs,
+            decoding_seq_ids=decoding_seq_ids,
             decoding_seq_lens=decoding_seq_lens,
             max_decoding_len=max_decoding_len,
             seq_block_size=seq_block_size,
@@ -517,6 +540,7 @@ class LlamaModel:
             position_cos=self._cos_cached[position_indices],
             position_sin=self._sin_cached[position_indices],
             ignore_kvcache=ignore_kvcache,
+            cpu_attention=cpu_attention,
         )
 
         return self._forward(

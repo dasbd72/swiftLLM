@@ -1,3 +1,4 @@
+import swiftllm_c
 import torch
 import triton
 import triton.language as tl
@@ -117,40 +118,56 @@ def store_kvcache(
     assert infer_state.decoding_seq_lens.is_contiguous()
 
     if infer_state.num_prefill_seqs > 0:
-        grid = (
-            infer_state.num_prefill_seqs,
-            cdiv(infer_state.max_prefill_len, engine_config.block_size),
-        )
-        _fwd_kvcache_mgmt_prefill_kernel[grid](
-            k_cache,
-            v_cache,
-            k,
-            v,
-            block_table,
-            infer_state.seq_ids,
-            infer_state.prefill_seq_start_locs,
-            infer_state.prefill_seq_lens,
-            model_config.num_kv_heads,
-            engine_config.block_size,
-            model_config.head_dim,
-            engine_config.max_blocks_per_seq,
-        )
+        if k_cache.device.type == "cuda":
+            grid = (
+                infer_state.num_prefill_seqs,
+                cdiv(infer_state.max_prefill_len, engine_config.block_size),
+            )
+            _fwd_kvcache_mgmt_prefill_kernel[grid](
+                k_cache,
+                v_cache,
+                k,
+                v,
+                block_table,
+                infer_state.seq_ids,
+                infer_state.prefill_seq_start_locs,
+                infer_state.prefill_seq_lens,
+                model_config.num_kv_heads,
+                engine_config.block_size,
+                model_config.head_dim,
+                engine_config.max_blocks_per_seq,
+            )
+        else:
+            raise NotImplementedError(
+                "Prefill kv-cache management is not implemented for CPU."
+            )
 
     if infer_state.num_decoding_seqs > 0:
-        grid = (infer_state.num_decoding_seqs,)
-        _fwd_kvcache_mgmt_decoding_kernel[grid](
-            k_cache,
-            v_cache,
-            k[infer_state.num_prefill_tokens :, :, :],
-            v[infer_state.num_prefill_tokens :, :, :],
-            block_table,
-            infer_state.seq_ids[infer_state.num_prefill_seqs :],
-            infer_state.decoding_seq_lens,
-            model_config.num_kv_heads,
-            engine_config.block_size,
-            model_config.head_dim,
-            engine_config.max_blocks_per_seq,
-        )
+        if k_cache.device.type == "cuda":
+            grid = (infer_state.num_decoding_seqs,)
+            _fwd_kvcache_mgmt_decoding_kernel[grid](
+                k_cache,
+                v_cache,
+                k[infer_state.num_prefill_tokens :, :, :],
+                v[infer_state.num_prefill_tokens :, :, :],
+                block_table,
+                infer_state.decoding_seq_ids,
+                infer_state.decoding_seq_lens,
+                model_config.num_kv_heads,
+                engine_config.block_size,
+                model_config.head_dim,
+                engine_config.max_blocks_per_seq,
+            )
+        else:
+            swiftllm_c.cpu_store_kvcache_decode(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                block_table,
+                infer_state.decoding_seq_ids,
+                infer_state.decoding_seq_lens,
+            )
 
         # for my_batch_id in range(infer_state.num_decoding_seqs):
         #     my_k = k[infer_state.num_prefill_tokens+my_batch_id]    # [num_kv_heads, head_dim]

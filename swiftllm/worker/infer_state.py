@@ -13,15 +13,16 @@ class LlamaInferState:
 
     num_prefill_seqs: int
     num_prefill_tokens: int
-    prefill_seq_start_locs: torch.Tensor  # [batch_size]
+    prefill_seq_start_locs: torch.Tensor
     prefill_seq_start_locs_with_end: (
         torch.Tensor
     )  # [batch_size+1], = prefill_seq_start_locs + [num_prefill_tokens]
-    prefill_seq_lens: torch.Tensor  # [batch_size]
+    prefill_seq_lens: torch.Tensor
     max_prefill_len: int
 
     num_decoding_seqs: int
-    decoding_seq_lens: torch.Tensor  # [batch_size]
+    decoding_seq_ids: torch.Tensor  # [num_decoding_seqs]
+    decoding_seq_lens: torch.Tensor
     max_decoding_len: int
 
     seq_block_size: int
@@ -31,3 +32,5 @@ class LlamaInferState:
     position_sin: torch.Tensor  # [num_tokens, hidden_size]
 
     ignore_kvcache: bool  # Skip storing the key/value cache, useful when profiling the number of kv blocks
+
+    cpu_attention: bool  # Use CPU attention implementation

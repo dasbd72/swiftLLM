@@ -30,15 +30,12 @@ class LlamaTransformerLayer:
         self.decoding_piggyback_stream = decoding_piggyback_stream
         self.layer_id = layer_id
 
-    def forward(
+    def pre_attn(
         self,
         input_embds: torch.Tensor,  # [num_tokens, hidden_size]
         residual_buf: torch.Tensor,  # [num_tokens, hidden_size]
-        k_cache: torch.Tensor,
-        v_cache: torch.Tensor,
-        block_table: torch.Tensor,
         infer_state: LlamaInferState,
-    ) -> torch.Tensor:
+    ):
         # (fused) Add last layer's residual, and perform RMSNorm
         # Before: input_embds is the output of the last FFN block, and residual_buf
         #         is the residual to be added to input_embds
@@ -75,22 +72,41 @@ class LlamaTransformerLayer:
         # Rotary emb
         rotary_embedding_inplace(q, k, infer_state)
 
-        if not infer_state.ignore_kvcache:
-            store_kvcache(
-                k,
-                v,
-                k_cache,
-                v_cache,
-                block_table,
-                self.model_config,
-                self.engine_config,
-                infer_state,
-            )
-        store_kvcache_event = torch.cuda.Event()
-        store_kvcache_event.record()
+        return q, k, v
 
+    def store_kv_cache(
+        self,
+        k: torch.Tensor,
+        v: torch.Tensor,
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        infer_state: LlamaInferState,
+    ):
+        store_kvcache(
+            k,
+            v,
+            k_cache,
+            v_cache,
+            block_table,
+            self.model_config,
+            self.engine_config,
+            infer_state,
+        )
+
+    def attn(
+        self,
+        q: torch.Tensor,  # [num_tokens, num_q_heads, head_dim]
+        k: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim]
+        v: torch.Tensor,  # [num_tokens, num_kv_heads, head_dim
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        store_kvcache_event: torch.cuda.Event,
+        block_table: torch.Tensor,
+        infer_state: LlamaInferState,
+        o: torch.Tensor,  # [num_tokens, hidden_size]
+    ):
         # Attention
-        o = input_embds  # [num_total_tokens, hidden_size]
         if infer_state.num_prefill_seqs > 0:
             if torch.cuda.get_device_capability() >= (8, 0):
                 # Here the performance of vLLM's flash attention is better than us,
@@ -133,10 +149,14 @@ class LlamaTransformerLayer:
                     infer_state,
                     o[infer_state.num_prefill_tokens :, :],
                 )
-                event = torch.cuda.Event()
-                event.record()
-            torch.cuda.default_stream().wait_event(event)
+            # Force cpu & gpu to synchronize here
+            self.decoding_piggyback_stream.synchronize()
 
+    def post_attn(
+        self,
+        o: torch.Tensor,  # [num_total_tokens, hidden_size]
+        residual_buf: torch.Tensor,  # [num_total_tokens, hidden_size]
+    ):
         # Output GEMM
         o = linear(o, self.weight.o_proj)  # [num_total_tokens, hidden_size]
 
@@ -147,9 +167,6 @@ class LlamaTransformerLayer:
             self.weight.ffn_norm,
             self.model_config.rms_norm_eps,
         )
-        q = None
-        k = None
-        v = None
 
         # FFN
         up_gate_proj = linear(o, self.weight.up_gate_proj)
@@ -160,3 +177,64 @@ class LlamaTransformerLayer:
         )
 
         return ffn_out
+
+    def forward(
+        self,
+        input_embds: torch.Tensor,  # [num_tokens, hidden_size]
+        residual_buf: torch.Tensor,  # [num_tokens, hidden_size]
+        k_cache: torch.Tensor,
+        v_cache: torch.Tensor,
+        block_table: torch.Tensor,
+        infer_state: LlamaInferState,
+    ) -> torch.Tensor:
+        q, k, v = self.pre_attn(
+            input_embds,
+            residual_buf,
+            infer_state,
+        )
+        if infer_state.cpu_attention:
+            # Move QKV to CPU for CPU attention
+            q = q.cpu()
+            k = k.cpu()
+            v = v.cpu()
+        if not infer_state.ignore_kvcache:
+            self.store_kv_cache(
+                k,
+                v,
+                k_cache,
+                v_cache,
+                block_table,
+                infer_state,
+            )
+        store_kvcache_event = torch.cuda.Event()
+        store_kvcache_event.record()
+
+        # Decode attention
+        o = torch.empty(
+            q.shape[0],
+            self.model_config.hidden_size,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        o = torch.empty(
+            q.shape[0],
+            self.model_config.hidden_size,
+            dtype=q.dtype,
+            device=q.device,
+        )
+        self.attn(
+            q,
+            k,
+            v,
+            k_cache,
+            v_cache,
+            store_kvcache_event,
+            block_table,
+            infer_state,
+            o,
+        )
+        if infer_state.cpu_attention:
+            # Move output back to GPU
+            o = o.cuda()
+        output_embds = self.post_attn(o, residual_buf)
+        return output_embds
