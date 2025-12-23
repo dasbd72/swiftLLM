@@ -25,11 +25,13 @@ class BlockManager:
         max_seqs_in_block_table: int,
         max_blocks_per_seq: int,
         block_size: int,
+        random_block_allocation: bool = False,
     ):
         self.device_name = device_name
         self.num_free_blocks = num_blocks
         self.num_blocks = num_blocks
         self.block_size = block_size
+        self.random_block_allocation = random_block_allocation
 
         # seq_id |-> number of blocks allocated for this sequence
         self.num_seq_allocated_blocks = torch.zeros(
@@ -57,9 +59,16 @@ class BlockManager:
                 f" {self.device_name} ({self.num_blocks} in total,"
                 f" {self.num_free_blocks} free, {num_blocks} requested)"
             )
-        selected_blocks = torch.nonzero(self.is_block_free)[:num_blocks].view(
-            -1
-        )
+        if self.random_block_allocation:
+            free_block_indices = torch.nonzero(self.is_block_free).view(-1)
+            perm = torch.randperm(
+                len(free_block_indices), device=free_block_indices.device
+            )
+            selected_blocks = free_block_indices[perm[:num_blocks]]
+        else:
+            selected_blocks = torch.nonzero(self.is_block_free)[
+                :num_blocks
+            ].view(-1)
         self.num_free_blocks -= num_blocks
         self.is_block_free[selected_blocks] = False
         return selected_blocks

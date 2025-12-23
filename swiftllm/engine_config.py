@@ -18,6 +18,7 @@ class EngineConfig:
     num_cpu_blocks: int
     max_seqs_in_block_table: int
     max_blocks_per_seq: int
+    random_block_allocation: bool
 
     # Scheduling-related parameters
     max_batch_size: int

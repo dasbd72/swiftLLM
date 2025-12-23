@@ -200,6 +200,7 @@ class LlamaModel:
                 self.engine_config.max_seqs_in_block_table,
                 self.engine_config.max_blocks_per_seq,
                 self.engine_config.block_size,
+                random_block_allocation=self.engine_config.random_block_allocation,
             )
             for layer_id in range(self.model_config.num_layers)
         ]
@@ -210,6 +211,7 @@ class LlamaModel:
                 self.engine_config.max_seqs_in_block_table,
                 self.engine_config.max_blocks_per_seq,
                 self.engine_config.block_size,
+                random_block_allocation=self.engine_config.random_block_allocation,
             )
             for layer_id in range(self.model_config.num_layers)
         ]
